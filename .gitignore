@@ -1,0 +1,38 @@
+# Configuración con credenciales
+config/config.php
+
+# Composer
+/vendor/
+composer.lock
+
+# Storage (archivos generados)
+storage/pdfs/*
+storage/logs/*
+storage/temp/*
+!storage/pdfs/.gitkeep
+!storage/logs/.gitkeep
+!storage/temp/.gitkeep
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Tests
+/tests/coverage/
+.phpunit.result.cache
+
+# Environment files
+.env
+.env.local
+.env.production
+
+# Backups
+*.sql
+*.sql.gz
