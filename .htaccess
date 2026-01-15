@@ -1,0 +1,40 @@
+# ============================================================================
+# .htaccess - Backend de Certificados ACG
+# Ubicación: /var/www/html/certificados/.htaccess
+# ============================================================================
+
+<IfModule mod_rewrite.c>
+    RewriteEngine On
+    RewriteBase /certificados/
+
+    # Redirigir todo a public/index.php excepto archivos/directorios existentes
+    RewriteCond %{REQUEST_FILENAME} !-f
+    RewriteCond %{REQUEST_FILENAME} !-d
+    RewriteRule ^(.*)$ public/index.php [QSA,L]
+</IfModule>
+
+# ============================================================================
+# CORS Headers (permitir acceso desde Angular dev server)
+# ============================================================================
+<IfModule mod_headers.c>
+    Header set Access-Control-Allow-Origin "http://localhost:4200"
+    Header set Access-Control-Allow-Methods "GET, POST, PUT, DELETE, OPTIONS"
+    Header set Access-Control-Allow-Headers "Content-Type, Authorization, X-Requested-With"
+    Header set Access-Control-Allow-Credentials "true"
+</IfModule>
+
+# ============================================================================
+# Security
+# ============================================================================
+# Denegar acceso directo a archivos de configuración
+<Files "config.php">
+    Require all denied
+</Files>
+
+<Files "composer.json">
+    Require all denied
+</Files>
+
+<Files "composer.lock">
+    Require all denied
+</Files>
