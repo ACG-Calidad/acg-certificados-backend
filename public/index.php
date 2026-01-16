@@ -66,6 +66,31 @@ try {
         $requestMethod === 'GET' && $requestUri === '/admin/certificates/pending' => handlePendingCertificates(),
 
         // ========================================================================
+        // Admin - Aprobar y generar certificados
+        // ========================================================================
+        $requestMethod === 'POST' && $requestUri === '/admin/certificates/approve' => handleApproveCertificates(),
+
+        // ========================================================================
+        // Admin - Conteos para badges del sidebar
+        // ========================================================================
+        $requestMethod === 'GET' && $requestUri === '/admin/badges' => handleAdminBadges(),
+
+        // ========================================================================
+        // Admin - Notificaciones pendientes
+        // ========================================================================
+        $requestMethod === 'GET' && $requestUri === '/admin/notifications/pending' => handlePendingNotifications(),
+
+        // ========================================================================
+        // Admin - Enviar notificaciones
+        // ========================================================================
+        $requestMethod === 'POST' && $requestUri === '/admin/notifications/send' => handleSendNotifications(),
+
+        // ========================================================================
+        // Admin - Exportar reporte de certificados (Excel/CSV)
+        // ========================================================================
+        $requestMethod === 'GET' && $requestUri === '/admin/report/export' => handleExportReport(),
+
+        // ========================================================================
         // 404 - Ruta no encontrada
         // ========================================================================
         default => Response::error('Endpoint no encontrado', 404, 'NOT_FOUND')
@@ -254,7 +279,10 @@ function handleCertificateDownload(int $id): void
 }
 
 /**
- * GET /api/certificates/validate/{code} - Validar certificado por código
+ * GET /api/certificates/validate/{code} - Validar certificado por código (público)
+ *
+ * Valida certificados con estado 'generado' o 'notificado' (ya emitidos).
+ * Este endpoint es público, no requiere autenticación.
  */
 function handleCertificateValidate(string $code): void
 {
@@ -270,31 +298,37 @@ function handleCertificateValidate(string $code): void
             c.intensidad,
             c.calificacion,
             c.estado,
+            u.firstname,
+            u.lastname,
             co.fullname as course_name,
             co.shortname as course_shortname
         FROM cc_certificados c
+        INNER JOIN mdl_user u ON c.userid = u.id
         INNER JOIN mdl_course co ON c.courseid = co.id
         WHERE c.numero_certificado = :code
-        AND c.estado = 'aprobado'
+        AND c.estado IN ('generado', 'notificado')
     ");
 
     $stmt->execute(['code' => $code]);
     $certificate = $stmt->fetch(PDO::FETCH_ASSOC);
 
     if (!$certificate) {
-        Response::json([
-            'valid' => false,
-            'error' => 'Certificado no encontrado o no válido'
-        ]);
+        Response::success([
+            'valid' => false
+        ], 'Certificado no encontrado o no válido');
         return;
     }
 
     $certificate['fecha_emision_formatted'] = date('d/m/Y', $certificate['fecha_emision']);
+    $certificate['participant_name'] = $certificate['firstname'] . ' ' . $certificate['lastname'];
 
-    Response::json([
+    // Remover campos sensibles de la respuesta
+    unset($certificate['firstname'], $certificate['lastname']);
+
+    Response::success([
         'valid' => true,
         'certificate' => $certificate
-    ]);
+    ], 'Certificado válido');
 }
 
 /**
@@ -313,12 +347,14 @@ function handleAdminDashboard(): void
     $stmt = $pdo->query("SELECT COUNT(*) FROM cc_certificados WHERE estado IN ('aprobado', 'generado', 'notificado')");
     $stats['total_certificates'] = (int)$stmt->fetchColumn();
 
-    // Pendientes (usuarios que completaron curso pero no tienen certificado)
+    // Pendientes (usuarios con calificación >= 80% que no tienen certificado)
     $stmt = $pdo->query("
-        SELECT COUNT(DISTINCT cc.userid)
-        FROM mdl_course_completions cc
-        LEFT JOIN cc_certificados cert ON cc.userid = cert.userid AND cc.course = cert.courseid
-        WHERE cc.timecompleted IS NOT NULL
+        SELECT COUNT(*)
+        FROM mdl_grade_grades gg
+        INNER JOIN mdl_grade_items gi ON gg.itemid = gi.id AND gi.itemtype = 'course'
+        LEFT JOIN cc_certificados cert ON gg.userid = cert.userid AND gi.courseid = cert.courseid
+        WHERE gg.finalgrade IS NOT NULL
+        AND gg.finalgrade >= 80
         AND cert.id IS NULL
     ");
     $stats['pending_certificates'] = (int)$stmt->fetchColumn();
@@ -407,6 +443,9 @@ function handleAdminDashboard(): void
 
 /**
  * GET /api/admin/certificates/pending - Usuarios pendientes de certificar
+ *
+ * Criterio: Usuarios con calificación en un curso que NO tienen certificado generado.
+ * La calificación mínima (80%) se filtra en el frontend para mayor flexibilidad.
  */
 function handlePendingCertificates(): void
 {
@@ -414,7 +453,8 @@ function handlePendingCertificates(): void
 
     $pdo = getDatabaseConnection();
 
-    // Usuarios que completaron cursos pero no tienen certificado
+    // Usuarios con calificación en cursos que no tienen certificado
+    // Se usa timemodified de mdl_grade_grades como fecha de última calificación
     $stmt = $pdo->query("
         SELECT
             u.id as userid,
@@ -425,32 +465,146 @@ function handlePendingCertificates(): void
             c.id as course_id,
             c.fullname as course_name,
             c.shortname as course_shortname,
-            cc.timecompleted as completion_date,
-            gg.finalgrade as grade
-        FROM mdl_course_completions cc
-        INNER JOIN mdl_user u ON cc.userid = u.id
-        INNER JOIN mdl_course c ON cc.course = c.id
-        LEFT JOIN mdl_grade_items gi ON gi.courseid = c.id AND gi.itemtype = 'course'
-        LEFT JOIN mdl_grade_grades gg ON gg.itemid = gi.id AND gg.userid = u.id
-        LEFT JOIN cc_certificados cert ON cc.userid = cert.userid AND cc.course = cert.courseid
-        WHERE cc.timecompleted IS NOT NULL
+            gg.finalgrade as grade,
+            gg.timemodified as grade_date
+        FROM mdl_grade_grades gg
+        INNER JOIN mdl_grade_items gi ON gg.itemid = gi.id AND gi.itemtype = 'course'
+        INNER JOIN mdl_user u ON gg.userid = u.id
+        INNER JOIN mdl_course c ON gi.courseid = c.id
+        LEFT JOIN cc_certificados cert ON gg.userid = cert.userid AND gi.courseid = cert.courseid
+        WHERE gg.finalgrade IS NOT NULL
         AND cert.id IS NULL
-        ORDER BY cc.timecompleted DESC
-        LIMIT 100
+        ORDER BY gg.timemodified DESC
     ");
 
     $pendingUsers = $stmt->fetchAll(PDO::FETCH_ASSOC);
 
-    // Formatear fechas
+    // Formatear datos
     foreach ($pendingUsers as &$user) {
-        $user['completion_date_formatted'] = date('Y-m-d H:i:s', $user['completion_date']);
         $user['grade'] = $user['grade'] ? round($user['grade'], 2) : null;
+        $user['grade_date_formatted'] = $user['grade_date'] ? date('Y-m-d H:i:s', $user['grade_date']) : null;
     }
 
     Response::success([
         'pending_users' => $pendingUsers,
         'total' => count($pendingUsers)
     ]);
+}
+
+/**
+ * POST /api/admin/certificates/approve - Aprobar usuarios y generar certificados
+ */
+function handleApproveCertificates(): void
+{
+    Response::validateMethod('POST');
+
+    $input = json_decode(file_get_contents('php://input'), true);
+
+    if (!isset($input['users']) || !is_array($input['users']) || empty($input['users'])) {
+        Response::error('Se requiere un array de usuarios', 400, 'INVALID_INPUT');
+    }
+
+    $pdo = getDatabaseConnection();
+    $approved = 0;
+    $certificatesCreated = 0;
+
+    foreach ($input['users'] as $userItem) {
+        if (!isset($userItem['userid']) || !isset($userItem['course_id'])) {
+            continue;
+        }
+
+        $userid = (int)$userItem['userid'];
+        $courseId = (int)$userItem['course_id'];
+
+        // Verificar que el usuario completó el curso
+        $stmt = $pdo->prepare("
+            SELECT
+                u.firstname,
+                u.lastname,
+                u.email,
+                u.idnumber,
+                c.fullname as course_name,
+                c.shortname as course_shortname,
+                cc.timecompleted as completion_date,
+                gg.finalgrade as grade
+            FROM mdl_course_completions cc
+            INNER JOIN mdl_user u ON cc.userid = u.id
+            INNER JOIN mdl_course c ON cc.course = c.id
+            LEFT JOIN mdl_grade_items gi ON gi.courseid = c.id AND gi.itemtype = 'course'
+            LEFT JOIN mdl_grade_grades gg ON gg.itemid = gi.id AND gg.userid = u.id
+            WHERE cc.userid = ? AND cc.course = ? AND cc.timecompleted IS NOT NULL
+        ");
+        $stmt->execute([$userid, $courseId]);
+        $userData = $stmt->fetch(PDO::FETCH_ASSOC);
+
+        if (!$userData) {
+            continue;
+        }
+
+        // Verificar que no existe ya un certificado
+        $stmt = $pdo->prepare("
+            SELECT id FROM cc_certificados WHERE userid = ? AND courseid = ?
+        ");
+        $stmt->execute([$userid, $courseId]);
+        if ($stmt->fetch()) {
+            continue; // Ya tiene certificado
+        }
+
+        // Generar número de certificado único
+        $numeroCertificado = generateCertificateNumber();
+
+        // Generar hash de validación
+        $hashValidacion = hash('sha256', $numeroCertificado . $userid . $courseId . time());
+
+        // Intensidad por defecto (40 horas) - TODO: obtener de configuración del curso en Moodle
+        $intensidad = 40;
+
+        // Crear registro del certificado con estado 'generado' (listo para notificar)
+        $stmt = $pdo->prepare("
+            INSERT INTO cc_certificados
+            (userid, courseid, numero_certificado, hash_validacion, fecha_emision, intensidad, calificacion, estado, created_by, created_at, updated_at)
+            VALUES (?, ?, ?, ?, UNIX_TIMESTAMP(), ?, ?, 'generado', ?, UNIX_TIMESTAMP(), UNIX_TIMESTAMP())
+        ");
+        $grade = $userData['grade'] ? round($userData['grade'], 2) : null;
+        $createdBy = $userid; // TODO: obtener del usuario autenticado en sesión
+        $stmt->execute([$userid, $courseId, $numeroCertificado, $hashValidacion, $intensidad, $grade, $createdBy]);
+
+        $certificatesCreated++;
+        $approved++;
+    }
+
+    Response::success([
+        'approved' => $approved,
+        'certificates_created' => $certificatesCreated
+    ]);
+}
+
+/**
+ * Genera un número de certificado único
+ * Formato: CV-XXXX donde XXXX es secuencial
+ */
+function generateCertificateNumber(): string
+{
+    $pdo = getDatabaseConnection();
+
+    // Obtener el último número de certificado
+    $stmt = $pdo->query("
+        SELECT numero_certificado FROM cc_certificados
+        WHERE numero_certificado LIKE 'CV-%'
+        ORDER BY CAST(SUBSTRING(numero_certificado, 4) AS UNSIGNED) DESC
+        LIMIT 1
+    ");
+    $lastCert = $stmt->fetch(PDO::FETCH_ASSOC);
+
+    if ($lastCert) {
+        $lastNumber = (int)substr($lastCert['numero_certificado'], 3);
+        $newNumber = $lastNumber + 1;
+    } else {
+        // Si no hay certificados previos, empezar en 3490 (después del último CV-3489)
+        $newNumber = 3490;
+    }
+
+    return 'CV-' . $newNumber;
 }
 
 // ============================================================================
@@ -538,4 +692,492 @@ function logDownload(array $certificate, string $ipAddress): void
         // No interrumpir descarga si falla el log
         error_log("Error logging download: " . $e->getMessage());
     }
+}
+
+/**
+ * GET /api/admin/notifications/pending - Certificados pendientes de notificar
+ *
+ * Lista certificados con estado 'generado' (PDF listo pero no notificado al usuario)
+ */
+function handlePendingNotifications(): void
+{
+    Response::validateMethod('GET');
+
+    $pdo = getDatabaseConnection();
+
+    // Certificados generados pendientes de notificación
+    $stmt = $pdo->query("
+        SELECT
+            c.id as certificate_id,
+            c.numero_certificado,
+            c.userid,
+            u.firstname,
+            u.lastname,
+            u.email,
+            c.courseid as course_id,
+            co.fullname as course_name,
+            co.shortname as course_shortname,
+            c.calificacion as grade,
+            FROM_UNIXTIME(c.fecha_emision, '%Y-%m-%d') as fecha_emision,
+            FROM_UNIXTIME(c.created_at, '%Y-%m-%d %H:%i:%s') as created_at
+        FROM cc_certificados c
+        INNER JOIN mdl_user u ON c.userid = u.id
+        INNER JOIN mdl_course co ON c.courseid = co.id
+        WHERE c.estado = 'generado'
+        ORDER BY c.created_at DESC
+    ");
+
+    $certificates = $stmt->fetchAll(PDO::FETCH_ASSOC);
+
+    Response::success([
+        'certificates' => $certificates,
+        'total' => count($certificates)
+    ]);
+}
+
+/**
+ * POST /api/admin/notifications/send - Enviar notificaciones por email
+ *
+ * Recibe un array de certificate_ids y envía emails a cada participante.
+ * Por ahora es un MOCK que simula el envío (integración con Google Apps Script pendiente).
+ */
+function handleSendNotifications(): void
+{
+    Response::validateMethod('POST');
+
+    $input = json_decode(file_get_contents('php://input'), true);
+
+    if (!isset($input['certificate_ids']) || !is_array($input['certificate_ids']) || empty($input['certificate_ids'])) {
+        Response::error('Se requiere un array de certificate_ids', 400, 'INVALID_INPUT');
+    }
+
+    $pdo = getDatabaseConnection();
+    $sent = 0;
+    $failed = 0;
+    $errors = [];
+
+    foreach ($input['certificate_ids'] as $certId) {
+        $certId = (int)$certId;
+
+        // Obtener datos del certificado
+        $stmt = $pdo->prepare("
+            SELECT
+                c.id,
+                c.numero_certificado,
+                c.userid,
+                c.estado,
+                u.firstname,
+                u.lastname,
+                u.email,
+                co.fullname as course_name
+            FROM cc_certificados c
+            INNER JOIN mdl_user u ON c.userid = u.id
+            INNER JOIN mdl_course co ON c.courseid = co.id
+            WHERE c.id = ?
+        ");
+        $stmt->execute([$certId]);
+        $cert = $stmt->fetch(PDO::FETCH_ASSOC);
+
+        if (!$cert) {
+            $failed++;
+            $errors[] = "Certificado ID $certId no encontrado";
+            continue;
+        }
+
+        if ($cert['estado'] !== 'generado') {
+            $failed++;
+            $errors[] = "Certificado {$cert['numero_certificado']} no está en estado 'generado'";
+            continue;
+        }
+
+        // ================================================================
+        // MOCK: Simular envío de email
+        // TODO: Integrar con Google Apps Script para envío real
+        // ================================================================
+        $emailSent = mockSendEmail($cert);
+
+        if ($emailSent) {
+            // Actualizar estado del certificado a 'notificado'
+            $stmt = $pdo->prepare("
+                UPDATE cc_certificados
+                SET estado = 'notificado',
+                    fecha_notificacion = UNIX_TIMESTAMP(),
+                    updated_at = UNIX_TIMESTAMP()
+                WHERE id = ?
+            ");
+            $stmt->execute([$certId]);
+
+            // Registrar en log de notificaciones
+            logNotification($pdo, $certId, $cert['email'], 'sent');
+
+            $sent++;
+        } else {
+            // Registrar fallo en log
+            logNotification($pdo, $certId, $cert['email'], 'failed', 'Error al enviar email (mock)');
+
+            $failed++;
+            $errors[] = "Error enviando a {$cert['email']}";
+        }
+    }
+
+    Response::success([
+        'sent' => $sent,
+        'failed' => $failed,
+        'errors' => $errors
+    ]);
+}
+
+/**
+ * MOCK: Simula el envío de un email
+ *
+ * En producción, esto llamará a Google Apps Script para enviar el email real.
+ * Por ahora, simula éxito en el 100% de los casos.
+ *
+ * @param array $certificate Datos del certificado
+ * @return bool true si el email se "envió" correctamente
+ */
+function mockSendEmail(array $certificate): bool
+{
+    // Simular un pequeño delay como si estuviéramos enviando
+    usleep(100000); // 100ms
+
+    // Log del mock para debugging
+    error_log(sprintf(
+        "[MOCK EMAIL] Enviando a: %s <%s> - Certificado: %s - Curso: %s",
+        $certificate['firstname'] . ' ' . $certificate['lastname'],
+        $certificate['email'],
+        $certificate['numero_certificado'],
+        $certificate['course_name']
+    ));
+
+    // TODO: Cuando se integre con Google Apps Script, esto será:
+    // return $gasService->sendCertificateNotification($certificate);
+
+    // Por ahora, siempre retorna éxito
+    return true;
+}
+
+/**
+ * Registra una notificación en el log
+ */
+function logNotification(PDO $pdo, int $certificateId, string $email, string $status, string $errorMessage = null): void
+{
+    try {
+        // Verificar si existe la tabla de log
+        $stmt = $pdo->query("SHOW TABLES LIKE 'cc_notifications_log'");
+        if (!$stmt->fetch()) {
+            // Crear tabla si no existe
+            $pdo->exec("
+                CREATE TABLE cc_notifications_log (
+                    id INT AUTO_INCREMENT PRIMARY KEY,
+                    certificate_id INT NOT NULL,
+                    recipient_email VARCHAR(255) NOT NULL,
+                    status ENUM('sent', 'failed', 'pending') NOT NULL DEFAULT 'pending',
+                    error_message TEXT,
+                    sent_at INT,
+                    created_at INT NOT NULL,
+                    INDEX idx_certificate (certificate_id),
+                    INDEX idx_status (status)
+                ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
+            ");
+        }
+
+        $stmt = $pdo->prepare("
+            INSERT INTO cc_notifications_log
+            (certificate_id, recipient_email, status, error_message, sent_at, created_at)
+            VALUES (?, ?, ?, ?, ?, UNIX_TIMESTAMP())
+        ");
+
+        $sentAt = ($status === 'sent') ? time() : null;
+        $stmt->execute([$certificateId, $email, $status, $errorMessage, $sentAt]);
+
+    } catch (\Exception $e) {
+        error_log("Error logging notification: " . $e->getMessage());
+    }
+}
+
+/**
+ * GET /api/admin/badges - Conteos para badges del sidebar
+ *
+ * Retorna:
+ * - pending_approved: Usuarios con calificación >= 80% sin certificado generado
+ * - pending_notifications: Certificados generados pendientes de notificar
+ */
+function handleAdminBadges(): void
+{
+    Response::validateMethod('GET');
+
+    $pdo = getDatabaseConnection();
+
+    // Usuarios con calificación >= 80% que no tienen certificado
+    $stmt = $pdo->query("
+        SELECT COUNT(*) as count
+        FROM mdl_grade_grades gg
+        INNER JOIN mdl_grade_items gi ON gg.itemid = gi.id AND gi.itemtype = 'course'
+        LEFT JOIN cc_certificados cert ON gg.userid = cert.userid AND gi.courseid = cert.courseid
+        WHERE gg.finalgrade IS NOT NULL
+        AND gg.finalgrade >= 80
+        AND cert.id IS NULL
+    ");
+    $pendingApproved = (int)$stmt->fetch(PDO::FETCH_ASSOC)['count'];
+
+    // Certificados generados pendientes de notificación
+    $stmt = $pdo->query("
+        SELECT COUNT(*) as count
+        FROM cc_certificados
+        WHERE estado = 'generado'
+    ");
+    $pendingNotifications = (int)$stmt->fetch(PDO::FETCH_ASSOC)['count'];
+
+    Response::success([
+        'pending_approved' => $pendingApproved,
+        'pending_notifications' => $pendingNotifications
+    ]);
+}
+
+/**
+ * GET /api/admin/report/export - Exportar reporte de certificados en Excel (XLSX)
+ *
+ * Incluye todos los certificados con sus estados:
+ * - Pendientes (usuarios con calificación >= 80% sin certificado)
+ * - Generados (certificado creado, pendiente de notificar)
+ * - Notificados (certificado enviado al participante)
+ */
+function handleExportReport(): void
+{
+    Response::validateMethod('GET');
+
+    $pdo = getDatabaseConnection();
+
+    // Obtener todos los datos para el reporte
+    $reportData = [];
+
+    // 1. Certificados existentes (generados y notificados)
+    $stmt = $pdo->query("
+        SELECT
+            c.numero_certificado,
+            u.firstname,
+            u.lastname,
+            u.email,
+            u.idnumber as documento,
+            co.fullname as curso,
+            co.shortname as curso_codigo,
+            c.calificacion,
+            c.intensidad,
+            c.estado,
+            FROM_UNIXTIME(c.fecha_emision, '%Y-%m-%d') as fecha_emision,
+            FROM_UNIXTIME(c.fecha_notificacion, '%Y-%m-%d') as fecha_notificacion
+        FROM cc_certificados c
+        INNER JOIN mdl_user u ON c.userid = u.id
+        INNER JOIN mdl_course co ON c.courseid = co.id
+        ORDER BY c.estado DESC, c.fecha_emision DESC
+    ");
+    $certificates = $stmt->fetchAll(PDO::FETCH_ASSOC);
+
+    foreach ($certificates as $cert) {
+        $reportData[] = [
+            'numero_certificado' => $cert['numero_certificado'],
+            'nombres' => $cert['firstname'],
+            'apellidos' => $cert['lastname'],
+            'email' => $cert['email'],
+            'documento' => $cert['documento'],
+            'curso' => $cert['curso'],
+            'curso_codigo' => $cert['curso_codigo'],
+            'calificacion' => $cert['calificacion'],
+            'intensidad' => $cert['intensidad'],
+            'estado' => ucfirst($cert['estado']),
+            'fecha_emision' => $cert['fecha_emision'],
+            'fecha_notificacion' => $cert['fecha_notificacion'] ?: ''
+        ];
+    }
+
+    // 2. Usuarios pendientes (calificación >= 80% sin certificado)
+    $stmt = $pdo->query("
+        SELECT
+            u.firstname,
+            u.lastname,
+            u.email,
+            u.idnumber as documento,
+            co.fullname as curso,
+            co.shortname as curso_codigo,
+            gg.finalgrade as calificacion,
+            FROM_UNIXTIME(gg.timemodified, '%Y-%m-%d') as fecha_calificacion
+        FROM mdl_grade_grades gg
+        INNER JOIN mdl_grade_items gi ON gg.itemid = gi.id AND gi.itemtype = 'course'
+        INNER JOIN mdl_user u ON gg.userid = u.id
+        INNER JOIN mdl_course co ON gi.courseid = co.id
+        LEFT JOIN cc_certificados cert ON gg.userid = cert.userid AND gi.courseid = cert.courseid
+        WHERE gg.finalgrade IS NOT NULL
+        AND gg.finalgrade >= 80
+        AND cert.id IS NULL
+        ORDER BY gg.timemodified DESC
+    ");
+    $pendingUsers = $stmt->fetchAll(PDO::FETCH_ASSOC);
+
+    foreach ($pendingUsers as $pending) {
+        $reportData[] = [
+            'numero_certificado' => '',
+            'nombres' => $pending['firstname'],
+            'apellidos' => $pending['lastname'],
+            'email' => $pending['email'],
+            'documento' => $pending['documento'],
+            'curso' => $pending['curso'],
+            'curso_codigo' => $pending['curso_codigo'],
+            'calificacion' => round($pending['calificacion'], 2),
+            'intensidad' => '',
+            'estado' => 'Pendiente',
+            'fecha_emision' => '',
+            'fecha_notificacion' => ''
+        ];
+    }
+
+    // Generar Excel usando PhpSpreadsheet si está disponible, sino CSV
+    $usePhpSpreadsheet = class_exists('\PhpOffice\PhpSpreadsheet\Spreadsheet');
+
+    if ($usePhpSpreadsheet) {
+        generateExcelSpreadsheet($reportData);
+    } else {
+        generateExcelCsv($reportData);
+    }
+}
+
+/**
+ * Genera archivo Excel usando PhpSpreadsheet
+ */
+function generateExcelSpreadsheet(array $data): void
+{
+    $spreadsheet = new \PhpOffice\PhpSpreadsheet\Spreadsheet();
+    $sheet = $spreadsheet->getActiveSheet();
+    $sheet->setTitle('Certificados');
+
+    // Headers
+    $headers = [
+        'A1' => 'No. Certificado',
+        'B1' => 'Nombres',
+        'C1' => 'Apellidos',
+        'D1' => 'Email',
+        'E1' => 'Documento',
+        'F1' => 'Curso',
+        'G1' => 'Código Curso',
+        'H1' => 'Calificación',
+        'I1' => 'Intensidad (h)',
+        'J1' => 'Estado',
+        'K1' => 'Fecha Emisión',
+        'L1' => 'Fecha Notificación'
+    ];
+
+    foreach ($headers as $cell => $value) {
+        $sheet->setCellValue($cell, $value);
+    }
+
+    // Estilo de headers
+    $headerStyle = [
+        'font' => ['bold' => true, 'color' => ['rgb' => 'FFFFFF']],
+        'fill' => [
+            'fillType' => \PhpOffice\PhpSpreadsheet\Style\Fill::FILL_SOLID,
+            'startColor' => ['rgb' => '0066CC']
+        ],
+        'alignment' => ['horizontal' => \PhpOffice\PhpSpreadsheet\Style\Alignment::HORIZONTAL_CENTER]
+    ];
+    $sheet->getStyle('A1:L1')->applyFromArray($headerStyle);
+
+    // Datos
+    $row = 2;
+    foreach ($data as $item) {
+        $sheet->setCellValue("A{$row}", $item['numero_certificado']);
+        $sheet->setCellValue("B{$row}", $item['nombres']);
+        $sheet->setCellValue("C{$row}", $item['apellidos']);
+        $sheet->setCellValue("D{$row}", $item['email']);
+        $sheet->setCellValue("E{$row}", $item['documento']);
+        $sheet->setCellValue("F{$row}", $item['curso']);
+        $sheet->setCellValue("G{$row}", $item['curso_codigo']);
+        $sheet->setCellValue("H{$row}", $item['calificacion']);
+        $sheet->setCellValue("I{$row}", $item['intensidad']);
+        $sheet->setCellValue("J{$row}", $item['estado']);
+        $sheet->setCellValue("K{$row}", $item['fecha_emision']);
+        $sheet->setCellValue("L{$row}", $item['fecha_notificacion']);
+
+        // Color por estado
+        $stateColor = match($item['estado']) {
+            'Pendiente' => 'FFF3CD',
+            'Generado' => 'D1ECF1',
+            'Notificado' => 'D4EDDA',
+            default => 'FFFFFF'
+        };
+        $sheet->getStyle("A{$row}:L{$row}")->getFill()
+            ->setFillType(\PhpOffice\PhpSpreadsheet\Style\Fill::FILL_SOLID)
+            ->getStartColor()->setRGB($stateColor);
+
+        $row++;
+    }
+
+    // Auto-size columns
+    foreach (range('A', 'L') as $col) {
+        $sheet->getColumnDimension($col)->setAutoSize(true);
+    }
+
+    // Output
+    $filename = 'reporte-certificados-' . date('Y-m-d') . '.xlsx';
+
+    header('Content-Type: application/vnd.openxmlformats-officedocument.spreadsheetml.sheet');
+    header('Content-Disposition: attachment; filename="' . $filename . '"');
+    header('Cache-Control: max-age=0');
+
+    $writer = new \PhpOffice\PhpSpreadsheet\Writer\Xlsx($spreadsheet);
+    $writer->save('php://output');
+    exit;
+}
+
+/**
+ * Genera archivo CSV compatible con Excel (fallback si no hay PhpSpreadsheet)
+ */
+function generateExcelCsv(array $data): void
+{
+    $filename = 'reporte-certificados-' . date('Y-m-d') . '.csv';
+
+    header('Content-Type: text/csv; charset=UTF-8');
+    header('Content-Disposition: attachment; filename="' . $filename . '"');
+    header('Cache-Control: max-age=0');
+
+    // BOM para UTF-8 en Excel
+    echo "\xEF\xBB\xBF";
+
+    $output = fopen('php://output', 'w');
+
+    // Headers - PHP 8.4 requiere el parámetro escape explícito
+    fputcsv($output, [
+        'No. Certificado',
+        'Nombres',
+        'Apellidos',
+        'Email',
+        'Documento',
+        'Curso',
+        'Código Curso',
+        'Calificación',
+        'Intensidad (h)',
+        'Estado',
+        'Fecha Emisión',
+        'Fecha Notificación'
+    ], ';', '"', '\\'); // separador, enclosure, escape
+
+    // Datos
+    foreach ($data as $item) {
+        fputcsv($output, [
+            $item['numero_certificado'],
+            $item['nombres'],
+            $item['apellidos'],
+            $item['email'],
+            $item['documento'],
+            $item['curso'],
+            $item['curso_codigo'],
+            $item['calificacion'],
+            $item['intensidad'],
+            $item['estado'],
+            $item['fecha_emision'],
+            $item['fecha_notificacion']
+        ], ';', '"', '\\');
+    }
+
+    fclose($output);
+    exit;
 }

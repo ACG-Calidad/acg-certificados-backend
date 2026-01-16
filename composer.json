@@ -15,10 +15,12 @@
         "ext-mbstring": "*",
         "ext-json": "*",
         "ext-curl": "*",
+        "ext-zip": "*",
+        "ext-gd": "*",
         "fpdf/fpdf": "^1.86",
         "setasign/fpdi": "^2.6",
         "aws/aws-sdk-php": "^3.0",
-        "firebase/php-jwt": "^6.0"
+        "phpoffice/phpspreadsheet": "^5.4"
     },
     "require-dev": {
         "phpunit/phpunit": "^11.0"
