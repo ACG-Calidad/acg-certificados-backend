@@ -16,7 +16,7 @@
     # CORS Headers
     Header set Access-Control-Allow-Origin "*"
     Header set Access-Control-Allow-Methods "GET, POST, PUT, DELETE, OPTIONS"
-    Header set Access-Control-Allow-Headers "Content-Type, Authorization"
+    Header set Access-Control-Allow-Headers "Content-Type, Authorization, X-User-Id, X-User-Name, X-User-Role"
 
     # Security Headers
     Header set X-Content-Type-Options "nosniff"

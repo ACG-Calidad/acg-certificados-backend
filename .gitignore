@@ -9,6 +9,8 @@ composer.lock
 storage/pdfs/*
 storage/logs/*
 storage/temp/*
+storage/fonts/*
+storage/templates/*
 !storage/pdfs/.gitkeep
 !storage/logs/.gitkeep
 !storage/temp/.gitkeep

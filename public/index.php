@@ -9,6 +9,7 @@ require_once __DIR__ . '/../config/config.php';
 use ACG\Certificados\Utils\Response;
 use ACG\Certificados\Services\MoodleService;
 use ACG\Certificados\Services\PdfService;
+use ACG\Certificados\Services\TemplateService;
 
 // Manejar preflight CORS
 Response::handlePreflight();
@@ -86,9 +87,90 @@ try {
         $requestMethod === 'POST' && $requestUri === '/admin/notifications/send' => handleSendNotifications(),
 
         // ========================================================================
+        // Admin - Listar todos los certificados generados
+        // ========================================================================
+        $requestMethod === 'GET' && $requestUri === '/admin/certificates/generated' => handleGeneratedCertificates(),
+
+        // ========================================================================
+        // Admin - Regenerar certificados (actualiza PDF y fecha)
+        // ========================================================================
+        $requestMethod === 'POST' && $requestUri === '/admin/certificates/regenerate' => handleRegenerateCertificates(),
+
+        // ========================================================================
+        // Admin - Descargar múltiples certificados como ZIP
+        // ========================================================================
+        $requestMethod === 'POST' && $requestUri === '/admin/certificates/download-zip' => handleDownloadCertificatesZip(),
+
+        // ========================================================================
+        // Admin - Obtener historial de generaciones de un certificado
+        // ========================================================================
+        $requestMethod === 'GET' && preg_match('#^/admin/certificates/(\d+)/generations$#', $requestUri, $matches) =>
+            handleGetCertificateGenerations((int)$matches[1]),
+
+        // ========================================================================
         // Admin - Exportar reporte de certificados (Excel/CSV)
         // ========================================================================
         $requestMethod === 'GET' && $requestUri === '/admin/report/export' => handleExportReport(),
+
+        // ========================================================================
+        // Admin - Configuración del sistema (GET)
+        // ========================================================================
+        $requestMethod === 'GET' && $requestUri === '/admin/settings' => handleGetSettings(),
+
+        // ========================================================================
+        // Admin - Configuración del sistema (PUT)
+        // ========================================================================
+        $requestMethod === 'PUT' && $requestUri === '/admin/settings' => handleUpdateSettings(),
+
+        // ========================================================================
+        // Admin - Plantillas: Listar todas
+        // ========================================================================
+        $requestMethod === 'GET' && $requestUri === '/admin/templates' => handleGetTemplates(),
+
+        // ========================================================================
+        // Admin - Plantillas: Subir/actualizar plantilla base
+        // ========================================================================
+        $requestMethod === 'POST' && $requestUri === '/admin/templates/base' => handleUploadBaseTemplate(),
+
+        // ========================================================================
+        // Admin - Plantillas: Subir/actualizar plantilla de curso
+        // ========================================================================
+        $requestMethod === 'POST' && preg_match('#^/admin/templates/course/(\d+)$#', $requestUri, $matches) =>
+            handleUploadCourseTemplate((int)$matches[1]),
+
+        // ========================================================================
+        // Admin - Plantillas: Eliminar plantilla de curso
+        // ========================================================================
+        $requestMethod === 'DELETE' && preg_match('#^/admin/templates/course/(\d+)$#', $requestUri, $matches) =>
+            handleDeleteCourseTemplate((int)$matches[1]),
+
+        // ========================================================================
+        // Admin - Plantillas: Descargar plantilla
+        // ========================================================================
+        $requestMethod === 'GET' && preg_match('#^/admin/templates/(\d+)/download$#', $requestUri, $matches) =>
+            handleDownloadTemplate((int)$matches[1]),
+
+        // ========================================================================
+        // Admin - Plantillas: Obtener imagen PNG de preview
+        // ========================================================================
+        $requestMethod === 'GET' && preg_match('#^/admin/templates/(\d+)/preview-image$#', $requestUri, $matches) =>
+            handleGetTemplatePreviewImage((int)$matches[1]),
+
+        // ========================================================================
+        // Admin - Plantillas: Preview de certificado
+        // ========================================================================
+        $requestMethod === 'POST' && $requestUri === '/admin/templates/preview' => handleTemplatePreview(),
+
+        // ========================================================================
+        // Admin - Plantillas: Guardar coordenadas de campos
+        // ========================================================================
+        $requestMethod === 'PUT' && preg_match('#^/admin/templates/(\d+)/fields$#', $requestUri, $matches) =>
+            handleSaveTemplateFields((int)$matches[1]),
+
+        // ========================================================================
+        // Admin - Plantillas: Obtener campos disponibles
+        // ========================================================================
+        $requestMethod === 'GET' && $requestUri === '/admin/templates/available-fields' => handleGetAvailableFields(),
 
         // ========================================================================
         // 404 - Ruta no encontrada
@@ -241,18 +323,18 @@ function handleCertificateDownload(int $id): void
     }
 
     try {
-        // Inicializar servicio de PDF
-        $pdfService = new PdfService();
+        // Inicializar servicio de plantillas (genera PDFs con plantillas personalizadas)
+        $templateService = new TemplateService($pdo);
 
         // Verificar si ya existe PDF generado
-        $existingPdf = $pdfService->getCertificatePath($certificate['numero_certificado']);
+        $existingPdf = $templateService->getCertificatePath($certificate['numero_certificado']);
 
         if ($existingPdf && file_exists($existingPdf)) {
-            // Usar PDF existente
+            // Usar PDF existente (caché)
             $pdfPath = $existingPdf;
         } else {
-            // Generar nuevo PDF
-            $pdfPath = $pdfService->generateCertificate($certificate);
+            // Generar nuevo PDF usando plantillas
+            $pdfPath = $templateService->generateCertificateForUser($certificate);
         }
 
         // Registrar descarga en log
@@ -505,8 +587,12 @@ function handleApproveCertificates(): void
     }
 
     $pdo = getDatabaseConnection();
+    $templateService = new \ACG\Certificados\Services\TemplateService($pdo);
+
     $approved = 0;
     $certificatesCreated = 0;
+    $pdfsGenerated = 0;
+    $errors = [];
 
     foreach ($input['users'] as $userItem) {
         if (!isset($userItem['userid']) || !isset($userItem['course_id'])) {
@@ -560,23 +646,552 @@ function handleApproveCertificates(): void
         $intensidad = 40;
 
         // Crear registro del certificado con estado 'generado' (listo para notificar)
+        $fechaEmision = time();
         $stmt = $pdo->prepare("
             INSERT INTO cc_certificados
             (userid, courseid, numero_certificado, hash_validacion, fecha_emision, intensidad, calificacion, estado, created_by, created_at, updated_at)
-            VALUES (?, ?, ?, ?, UNIX_TIMESTAMP(), ?, ?, 'generado', ?, UNIX_TIMESTAMP(), UNIX_TIMESTAMP())
+            VALUES (?, ?, ?, ?, ?, ?, ?, 'generado', ?, UNIX_TIMESTAMP(), UNIX_TIMESTAMP())
         ");
         $grade = $userData['grade'] ? round($userData['grade'], 2) : null;
-        $createdBy = $userid; // TODO: obtener del usuario autenticado en sesión
-        $stmt->execute([$userid, $courseId, $numeroCertificado, $hashValidacion, $intensidad, $grade, $createdBy]);
+        $createdBy = getAuthenticatedUserId() ?? $userid;
+        $stmt->execute([$userid, $courseId, $numeroCertificado, $hashValidacion, $fechaEmision, $intensidad, $grade, $createdBy]);
+
+        // Obtener el ID del certificado recién insertado
+        $certificateId = (int)$pdo->lastInsertId();
 
         $certificatesCreated++;
         $approved++;
+
+        // Generar el PDF del certificado inmediatamente
+        try {
+            $certificateData = [
+                'numero_certificado' => $numeroCertificado,
+                'userid' => $userid,
+                'courseid' => $courseId,
+                'firstname' => $userData['firstname'],
+                'lastname' => $userData['lastname'],
+                'idnumber' => $userData['idnumber'],
+                'course_name' => $userData['course_name'],
+                'intensidad' => $intensidad,
+                'fecha_emision' => $fechaEmision
+            ];
+
+            // Medir tiempo de generación
+            $startTime = microtime(true);
+
+            $pdfPath = $templateService->generateCertificateForUser($certificateData);
+
+            $endTime = microtime(true);
+            $tiempoProcesamiento = (int)(($endTime - $startTime) * 1000); // en ms
+
+            // Registrar la primera generación en el log
+            logCertificateGeneration(
+                $pdo,
+                $certificateId,
+                $userid,
+                $courseId,
+                $pdfPath,
+                null, // pdf_size se calcula automáticamente
+                $tiempoProcesamiento,
+                'exitoso'
+            );
+
+            $pdfsGenerated++;
+        } catch (Exception $e) {
+            // Registrar el fallo en el log
+            logCertificateGeneration(
+                $pdo,
+                $certificateId,
+                $userid,
+                $courseId,
+                '',
+                null,
+                null,
+                'fallido',
+                $e->getMessage()
+            );
+
+            $errors[] = "Error generando PDF para {$userData['firstname']} {$userData['lastname']}: " . $e->getMessage();
+            error_log("Error generating PDF for certificate {$numeroCertificado}: " . $e->getMessage());
+        }
+    }
+
+    $response = [
+        'approved' => $approved,
+        'certificates_created' => $certificatesCreated,
+        'pdfs_generated' => $pdfsGenerated
+    ];
+
+    if (!empty($errors)) {
+        $response['warnings'] = $errors;
+    }
+
+    Response::success($response);
+}
+
+/**
+ * GET /admin/certificates/generated - Listar todos los certificados generados
+ *
+ * Parámetros de query:
+ * - search: Buscar por nombre, documento o curso
+ * - sort: Campo de ordenamiento (numero_certificado, fecha_emision)
+ * - order: Dirección (asc, desc)
+ * - page: Número de página
+ * - limit: Elementos por página
+ */
+function handleGeneratedCertificates(): void
+{
+    Response::validateMethod('GET');
+
+    $pdo = getDatabaseConnection();
+
+    // Parámetros de filtrado y paginación
+    $search = $_GET['search'] ?? '';
+    $sortField = $_GET['sort'] ?? 'fecha_emision';
+    $sortOrder = strtoupper($_GET['order'] ?? 'DESC') === 'ASC' ? 'ASC' : 'DESC';
+    $page = max(1, (int)($_GET['page'] ?? 1));
+    $limit = min(100, max(10, (int)($_GET['limit'] ?? 25)));
+    $offset = ($page - 1) * $limit;
+
+    // Validar campo de ordenamiento
+    $allowedSortFields = ['numero_certificado', 'fecha_emision', 'created_at'];
+    if (!in_array($sortField, $allowedSortFields)) {
+        $sortField = 'fecha_emision';
+    }
+
+    // Construir query base
+    $baseQuery = "
+        FROM cc_certificados c
+        INNER JOIN mdl_user u ON c.userid = u.id
+        INNER JOIN mdl_course co ON c.courseid = co.id
+        WHERE c.estado IN ('generado', 'notificado')
+    ";
+
+    $params = [];
+
+    // Agregar filtro de búsqueda
+    if (!empty($search)) {
+        $searchPattern = '%' . $search . '%';
+        $baseQuery .= " AND (
+            CONCAT(u.firstname, ' ', u.lastname) LIKE :search1
+            OR u.idnumber LIKE :search2
+            OR co.fullname LIKE :search3
+            OR co.shortname LIKE :search4
+            OR c.numero_certificado LIKE :search5
+        )";
+        $params['search1'] = $searchPattern;
+        $params['search2'] = $searchPattern;
+        $params['search3'] = $searchPattern;
+        $params['search4'] = $searchPattern;
+        $params['search5'] = $searchPattern;
+    }
+
+    // Contar total
+    $countStmt = $pdo->prepare("SELECT COUNT(*) as total " . $baseQuery);
+    $countStmt->execute($params);
+    $total = (int)$countStmt->fetch(PDO::FETCH_ASSOC)['total'];
+
+    // Obtener certificados
+    $query = "
+        SELECT
+            c.id,
+            c.numero_certificado,
+            c.userid,
+            c.courseid,
+            c.fecha_emision,
+            c.intensidad,
+            c.calificacion,
+            c.estado,
+            c.created_at,
+            c.updated_at,
+            u.firstname,
+            u.lastname,
+            u.idnumber,
+            u.email,
+            co.fullname as course_name,
+            co.shortname as course_shortname
+        " . $baseQuery . "
+        ORDER BY {$sortField} {$sortOrder}
+        LIMIT :limit OFFSET :offset
+    ";
+
+    $stmt = $pdo->prepare($query);
+    foreach ($params as $key => $value) {
+        $stmt->bindValue(':' . $key, $value);
+    }
+    $stmt->bindValue(':limit', $limit, PDO::PARAM_INT);
+    $stmt->bindValue(':offset', $offset, PDO::PARAM_INT);
+    $stmt->execute();
+
+    $certificates = $stmt->fetchAll(PDO::FETCH_ASSOC);
+
+    // Formatear fechas y verificar existencia de PDFs
+    $templateService = new TemplateService($pdo);
+    foreach ($certificates as &$cert) {
+        $cert['fecha_emision_formatted'] = date('d/m/Y', $cert['fecha_emision']);
+        $cert['created_at_formatted'] = date('d/m/Y H:i', $cert['created_at']);
+        $cert['participante'] = $cert['firstname'] . ' ' . $cert['lastname'];
+
+        // Verificar si existe el PDF
+        $pdfPath = $templateService->getCertificatePath($cert['numero_certificado']);
+        $cert['pdf_exists'] = $pdfPath !== null && file_exists($pdfPath);
     }
 
     Response::success([
-        'approved' => $approved,
-        'certificates_created' => $certificatesCreated
+        'certificates' => $certificates,
+        'pagination' => [
+            'total' => $total,
+            'page' => $page,
+            'limit' => $limit,
+            'pages' => ceil($total / $limit)
+        ]
     ]);
+}
+
+/**
+ * POST /admin/certificates/regenerate - Regenerar certificados
+ *
+ * Body: { certificate_ids: [1, 2, 3] }
+ *
+ * Regenera los PDFs de los certificados seleccionados usando la plantilla actual.
+ * NO modifica fecha_emision (es la fecha de la última calificación).
+ * Registra cada generación en cc_generaciones_log.
+ */
+function handleRegenerateCertificates(): void
+{
+    Response::validateMethod('POST');
+
+    $input = json_decode(file_get_contents('php://input'), true);
+
+    if (!isset($input['certificate_ids']) || !is_array($input['certificate_ids']) || empty($input['certificate_ids'])) {
+        Response::error('Se requiere un array de IDs de certificados', 400, 'INVALID_INPUT');
+    }
+
+    $pdo = getDatabaseConnection();
+    $templateService = new TemplateService($pdo);
+
+    $regenerated = 0;
+    $failed = 0;
+    $details = [];
+
+    foreach ($input['certificate_ids'] as $certId) {
+        $certId = (int)$certId;
+
+        try {
+            // Obtener datos del certificado
+            $stmt = $pdo->prepare("
+                SELECT
+                    c.*,
+                    u.firstname,
+                    u.lastname,
+                    u.email,
+                    u.idnumber,
+                    co.fullname as course_name,
+                    co.shortname as course_shortname
+                FROM cc_certificados c
+                INNER JOIN mdl_user u ON c.userid = u.id
+                INNER JOIN mdl_course co ON c.courseid = co.id
+                WHERE c.id = :id
+            ");
+            $stmt->execute(['id' => $certId]);
+            $certificate = $stmt->fetch(PDO::FETCH_ASSOC);
+
+            if (!$certificate) {
+                $failed++;
+                $details[] = [
+                    'id' => $certId,
+                    'numero_certificado' => null,
+                    'success' => false,
+                    'error' => "Certificado no encontrado"
+                ];
+                continue;
+            }
+
+            // Eliminar PDF existente si existe
+            $existingPdf = $templateService->getCertificatePath($certificate['numero_certificado']);
+            if ($existingPdf && file_exists($existingPdf)) {
+                unlink($existingPdf);
+            }
+
+            // NO actualizar fecha_emision - es la fecha de la última calificación
+            // Solo actualizar updated_at
+            $stmt = $pdo->prepare("
+                UPDATE cc_certificados
+                SET updated_at = UNIX_TIMESTAMP()
+                WHERE id = :id
+            ");
+            $stmt->execute(['id' => $certId]);
+
+            // Medir tiempo de generación
+            $startTime = microtime(true);
+
+            // Generar nuevo PDF (usando la fecha_emision original)
+            $pdfPath = $templateService->generateCertificateForUser($certificate);
+
+            $endTime = microtime(true);
+            $tiempoProcesamiento = (int)(($endTime - $startTime) * 1000); // en ms
+
+            // Registrar en log de generaciones
+            logCertificateGeneration(
+                $pdo,
+                $certId,
+                (int)$certificate['userid'],
+                (int)$certificate['courseid'],
+                $pdfPath,
+                null, // pdf_size se calcula automáticamente
+                $tiempoProcesamiento,
+                'exitoso'
+            );
+
+            $regenerated++;
+            $details[] = [
+                'id' => $certId,
+                'numero_certificado' => $certificate['numero_certificado'],
+                'success' => true
+            ];
+
+        } catch (Exception $e) {
+            // Registrar el fallo en el log
+            if (isset($certificate) && $certificate) {
+                logCertificateGeneration(
+                    $pdo,
+                    $certId,
+                    (int)$certificate['userid'],
+                    (int)$certificate['courseid'],
+                    '',
+                    null,
+                    null,
+                    'fallido',
+                    $e->getMessage()
+                );
+            }
+
+            $failed++;
+            $details[] = [
+                'id' => $certId,
+                'numero_certificado' => $certificate['numero_certificado'] ?? null,
+                'success' => false,
+                'error' => $e->getMessage()
+            ];
+        }
+    }
+
+    Response::success([
+        'regenerated' => $regenerated,
+        'failed' => $failed,
+        'details' => $details
+    ]);
+}
+
+/**
+ * Registra una generación de certificado en el log
+ *
+ * Usa la tabla cc_generaciones_log existente con su estructura completa.
+ *
+ * @param PDO $pdo Conexión a BD
+ * @param int $certificadoId ID del certificado
+ * @param int $userid ID del usuario para quien se genera
+ * @param int $courseid ID del curso
+ * @param string $pdfPath Ruta del PDF generado
+ * @param int|null $pdfSize Tamaño del PDF en bytes
+ * @param int|null $tiempoProcesamiento Tiempo de procesamiento en ms
+ * @param string $resultado 'exitoso' o 'fallido'
+ * @param string|null $mensajeError Mensaje de error si falló
+ */
+function logCertificateGeneration(
+    PDO $pdo,
+    int $certificadoId,
+    int $userid,
+    int $courseid,
+    string $pdfPath,
+    ?int $pdfSize = null,
+    ?int $tiempoProcesamiento = null,
+    string $resultado = 'exitoso',
+    ?string $mensajeError = null
+): void {
+    // Obtener tamaño del PDF si no se proporcionó
+    if ($pdfSize === null && file_exists($pdfPath)) {
+        $pdfSize = filesize($pdfPath);
+    }
+
+    // Obtener el usuario autenticado (admin/gestor que realiza la acción)
+    $authenticatedUserId = getAuthenticatedUserId() ?? $userid;
+
+    $stmt = $pdo->prepare("
+        INSERT INTO cc_generaciones_log
+        (certificado_id, userid, courseid, resultado, mensaje_error, tiempo_procesamiento,
+         pdf_generado, pdf_size, generado_por, generado_en, ip_address, user_agent)
+        VALUES (:cert_id, :userid, :courseid, :resultado, :mensaje_error, :tiempo,
+                :pdf_generado, :pdf_size, :generado_por, UNIX_TIMESTAMP(), :ip, :user_agent)
+    ");
+    $stmt->execute([
+        'cert_id' => $certificadoId,
+        'userid' => $userid,
+        'courseid' => $courseid,
+        'resultado' => $resultado,
+        'mensaje_error' => $mensajeError,
+        'tiempo' => $tiempoProcesamiento,
+        'pdf_generado' => $resultado === 'exitoso' ? 1 : 0,
+        'pdf_size' => $pdfSize,
+        'generado_por' => $authenticatedUserId,
+        'ip' => $_SERVER['REMOTE_ADDR'] ?? null,
+        'user_agent' => substr($_SERVER['HTTP_USER_AGENT'] ?? '', 0, 500)
+    ]);
+}
+
+/**
+ * GET /admin/certificates/{id}/generations - Obtener historial de generaciones
+ *
+ * Devuelve un array con todas las generaciones registradas de un certificado.
+ */
+function handleGetCertificateGenerations(int $certificateId): void
+{
+    Response::validateMethod('GET');
+
+    $pdo = getDatabaseConnection();
+
+    // Verificar que el certificado existe
+    $stmt = $pdo->prepare("SELECT numero_certificado FROM cc_certificados WHERE id = ?");
+    $stmt->execute([$certificateId]);
+    $certificate = $stmt->fetch(PDO::FETCH_ASSOC);
+
+    if (!$certificate) {
+        Response::error('Certificado no encontrado', 404, 'NOT_FOUND');
+    }
+
+    // Obtener historial de generaciones
+    $stmt = $pdo->prepare("
+        SELECT
+            g.id,
+            g.certificado_id,
+            g.userid,
+            g.courseid,
+            g.plantilla_id,
+            g.resultado,
+            g.mensaje_error,
+            g.tiempo_procesamiento,
+            g.pdf_generado,
+            g.pdf_size,
+            g.generado_por,
+            g.generado_en,
+            FROM_UNIXTIME(g.generado_en, '%Y-%m-%d %H:%i:%s') as generado_en_formatted,
+            g.ip_address,
+            u.firstname as generado_por_nombre,
+            u.lastname as generado_por_apellido
+        FROM cc_generaciones_log g
+        LEFT JOIN mdl_user u ON g.generado_por = u.id
+        WHERE g.certificado_id = ?
+        ORDER BY g.generado_en DESC
+    ");
+    $stmt->execute([$certificateId]);
+    $generations = $stmt->fetchAll(PDO::FETCH_ASSOC);
+
+    Response::success([
+        'certificate_id' => $certificateId,
+        'numero_certificado' => $certificate['numero_certificado'],
+        'generations' => $generations,
+        'total' => count($generations)
+    ]);
+}
+
+/**
+ * POST /admin/certificates/download-zip - Descargar múltiples certificados como ZIP
+ *
+ * Body: { certificate_ids: [1, 2, 3] }
+ */
+function handleDownloadCertificatesZip(): void
+{
+    Response::validateMethod('POST');
+
+    $input = json_decode(file_get_contents('php://input'), true);
+
+    if (!isset($input['certificate_ids']) || !is_array($input['certificate_ids']) || empty($input['certificate_ids'])) {
+        Response::error('Se requiere un array de IDs de certificados', 400, 'INVALID_INPUT');
+    }
+
+    $pdo = getDatabaseConnection();
+    $templateService = new TemplateService($pdo);
+
+    // Crear archivo ZIP temporal
+    $zipPath = TEMP_PATH . '/certificates_' . date('YmdHis') . '_' . uniqid() . '.zip';
+    $zip = new ZipArchive();
+
+    if ($zip->open($zipPath, ZipArchive::CREATE) !== true) {
+        Response::error('Error creando archivo ZIP', 500, 'ZIP_ERROR');
+    }
+
+    $added = 0;
+    $errors = [];
+
+    foreach ($input['certificate_ids'] as $certId) {
+        $certId = (int)$certId;
+
+        try {
+            // Obtener datos del certificado
+            $stmt = $pdo->prepare("
+                SELECT
+                    c.*,
+                    u.firstname,
+                    u.lastname,
+                    u.idnumber,
+                    co.fullname as course_name,
+                    co.shortname as course_shortname
+                FROM cc_certificados c
+                INNER JOIN mdl_user u ON c.userid = u.id
+                INNER JOIN mdl_course co ON c.courseid = co.id
+                WHERE c.id = :id
+            ");
+            $stmt->execute(['id' => $certId]);
+            $certificate = $stmt->fetch(PDO::FETCH_ASSOC);
+
+            if (!$certificate) {
+                $errors[] = "Certificado ID {$certId} no encontrado";
+                continue;
+            }
+
+            // Verificar si existe el PDF, si no, generarlo
+            $pdfPath = $templateService->getCertificatePath($certificate['numero_certificado']);
+            if (!$pdfPath || !file_exists($pdfPath)) {
+                $pdfPath = $templateService->generateCertificateForUser($certificate);
+            }
+
+            // Nombre del archivo en el ZIP
+            $zipFilename = sprintf(
+                '%s_%s_%s.pdf',
+                $certificate['numero_certificado'],
+                preg_replace('/[^a-zA-Z0-9]/', '_', $certificate['lastname']),
+                preg_replace('/[^a-zA-Z0-9]/', '_', $certificate['firstname'])
+            );
+
+            $zip->addFile($pdfPath, $zipFilename);
+            $added++;
+
+        } catch (Exception $e) {
+            $errors[] = "Error con certificado ID {$certId}: " . $e->getMessage();
+        }
+    }
+
+    $zip->close();
+
+    if ($added === 0) {
+        // No se agregó ningún archivo, eliminar ZIP y reportar error
+        if (file_exists($zipPath)) {
+            unlink($zipPath);
+        }
+        Response::error('No se pudo agregar ningún certificado al ZIP', 500, 'ZIP_EMPTY', ['errors' => $errors]);
+    }
+
+    // Enviar ZIP al navegador
+    header('Content-Type: application/zip');
+    header('Content-Disposition: attachment; filename="certificados_' . date('Y-m-d') . '.zip"');
+    header('Content-Length: ' . filesize($zipPath));
+    header('Cache-Control: private, max-age=0, must-revalidate');
+
+    readfile($zipPath);
+
+    // Limpiar archivo temporal
+    unlink($zipPath);
+    exit;
 }
 
 /**
@@ -610,6 +1225,37 @@ function generateCertificateNumber(): string
 // ============================================================================
 // HELPERS
 // ============================================================================
+
+/**
+ * Obtiene el ID del usuario autenticado desde los headers HTTP.
+ *
+ * El frontend envía el header X-User-Id con el ID del usuario que realiza la acción.
+ * Esto es diferente del participante del certificado.
+ *
+ * @return int|null ID del usuario autenticado o null si no está disponible
+ */
+function getAuthenticatedUserId(): ?int
+{
+    // Intentar obtener de diferentes formatos de header
+    $headers = [];
+    if (function_exists('getallheaders')) {
+        $headers = getallheaders();
+    }
+
+    // Buscar X-User-Id (el header puede llegar con diferentes formatos)
+    $userId = null;
+
+    // Formato directo
+    if (isset($headers['X-User-Id'])) {
+        $userId = (int) $headers['X-User-Id'];
+    }
+    // Formato Apache (convierte a lowercase con guiones)
+    elseif (isset($_SERVER['HTTP_X_USER_ID'])) {
+        $userId = (int) $_SERVER['HTTP_X_USER_ID'];
+    }
+
+    return $userId ?: null;
+}
 
 /**
  * Obtiene conexión a la base de datos
@@ -1180,4 +1826,472 @@ function generateExcelCsv(array $data): void
 
     fclose($output);
     exit;
+}
+
+/**
+ * GET /api/admin/settings - Obtener configuración del sistema
+ */
+function handleGetSettings(): void
+{
+    Response::validateMethod('GET');
+
+    $pdo = getDatabaseConnection();
+
+    // Verificar si existe la tabla de configuración
+    ensureSettingsTableExists($pdo);
+
+    // Obtener configuraciones
+    $stmt = $pdo->query("SELECT setting_key, setting_value FROM cc_settings");
+    $rows = $stmt->fetchAll(PDO::FETCH_KEY_PAIR);
+
+    // Valores por defecto
+    $defaults = getDefaultSettings();
+
+    // Combinar con valores guardados
+    $settings = [];
+    foreach ($defaults as $key => $default) {
+        $settings[$key] = $rows[$key] ?? $default;
+
+        // Convertir tipos según corresponda
+        if (in_array($key, ['default_intensity', 'default_template_id'])) {
+            $settings[$key] = (int)$settings[$key];
+        }
+        if ($key === 'gas_enabled') {
+            $settings[$key] = (bool)$settings[$key];
+        }
+    }
+
+    Response::success($settings);
+}
+
+/**
+ * PUT /api/admin/settings - Actualizar configuración del sistema
+ */
+function handleUpdateSettings(): void
+{
+    Response::validateMethod('PUT');
+
+    $input = json_decode(file_get_contents('php://input'), true);
+
+    if (!$input || !is_array($input)) {
+        Response::error('Datos de configuración inválidos', 400, 'INVALID_INPUT');
+    }
+
+    $pdo = getDatabaseConnection();
+
+    // Verificar si existe la tabla
+    ensureSettingsTableExists($pdo);
+
+    // Claves permitidas
+    $allowedKeys = array_keys(getDefaultSettings());
+
+    // Actualizar cada configuración
+    $updated = 0;
+    foreach ($input as $key => $value) {
+        if (!in_array($key, $allowedKeys)) {
+            continue; // Ignorar claves no permitidas
+        }
+
+        // Validar valores específicos
+        if ($key === 'default_intensity' && (!is_numeric($value) || $value < 1)) {
+            continue;
+        }
+        if ($key === 'cron_execution_time' && !preg_match('/^\d{2}:\d{2}$/', $value)) {
+            continue;
+        }
+        if ($key === 'notification_email' && !filter_var($value, FILTER_VALIDATE_EMAIL)) {
+            continue;
+        }
+
+        // Convertir booleanos a string
+        if (is_bool($value)) {
+            $value = $value ? '1' : '0';
+        }
+
+        // Insertar o actualizar
+        $stmt = $pdo->prepare("
+            INSERT INTO cc_settings (setting_key, setting_value, updated_at)
+            VALUES (:key, :value, UNIX_TIMESTAMP())
+            ON DUPLICATE KEY UPDATE
+            setting_value = VALUES(setting_value),
+            updated_at = UNIX_TIMESTAMP()
+        ");
+        $stmt->execute(['key' => $key, 'value' => (string)$value]);
+        $updated++;
+    }
+
+    // Obtener configuración actualizada
+    $stmt = $pdo->query("SELECT setting_key, setting_value FROM cc_settings");
+    $rows = $stmt->fetchAll(PDO::FETCH_KEY_PAIR);
+
+    $defaults = getDefaultSettings();
+    $settings = [];
+    foreach ($defaults as $key => $default) {
+        $settings[$key] = $rows[$key] ?? $default;
+        if (in_array($key, ['default_intensity', 'default_template_id'])) {
+            $settings[$key] = (int)$settings[$key];
+        }
+        if ($key === 'gas_enabled') {
+            $settings[$key] = (bool)$settings[$key];
+        }
+    }
+
+    Response::success([
+        'updated' => true,
+        'settings' => $settings
+    ], "Se actualizaron {$updated} configuraciones");
+}
+
+/**
+ * Retorna los valores por defecto de configuración
+ */
+function getDefaultSettings(): array
+{
+    return [
+        'default_intensity' => '40',
+        'default_template_id' => '1',
+        'certificate_prefix' => 'CV-',
+        'notification_email' => EMAIL_GESTOR ?? 'cursosvirtualesacg@gmail.com',
+        'email_from_name' => EMAIL_FROM_NAME ?? 'Grupo Capacitación ACG',
+        'cron_execution_time' => CRON_HORA_EJECUCION ?? '07:00',
+        'gas_webhook_url' => GAS_WEBHOOK_URL ?? '',
+        'gas_enabled' => '0',
+        'validation_url' => 'https://certificados.acgcalidad.co/validar'
+    ];
+}
+
+/**
+ * Asegura que la tabla de configuración exista
+ */
+function ensureSettingsTableExists(PDO $pdo): void
+{
+    $stmt = $pdo->query("SHOW TABLES LIKE 'cc_settings'");
+    if (!$stmt->fetch()) {
+        $pdo->exec("
+            CREATE TABLE cc_settings (
+                id INT AUTO_INCREMENT PRIMARY KEY,
+                setting_key VARCHAR(100) NOT NULL UNIQUE,
+                setting_value TEXT,
+                updated_at INT,
+                INDEX idx_key (setting_key)
+            ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
+        ");
+    }
+}
+
+// ============================================================================
+// HANDLERS - PLANTILLAS
+// ============================================================================
+
+/**
+ * GET /admin/templates - Lista todas las plantillas
+ */
+function handleGetTemplates(): void
+{
+    Response::validateMethod('GET');
+
+    try {
+        $pdo = getDatabaseConnection();
+        $templateService = new TemplateService($pdo);
+
+        $data = $templateService->getAllTemplates();
+
+        Response::success([
+            'base_template' => $data['base_template'],
+            'course_templates' => $data['course_templates'],
+            'courses_without_template' => $data['courses_without_template'],
+            'second_page_fields' => $data['second_page_fields']
+        ]);
+
+    } catch (Exception $e) {
+        Response::error(
+            'Error obteniendo plantillas',
+            500,
+            'TEMPLATES_ERROR',
+            DEBUG_MODE ? ['error' => $e->getMessage()] : []
+        );
+    }
+}
+
+/**
+ * POST /admin/templates/base - Sube o actualiza la plantilla base
+ */
+function handleUploadBaseTemplate(): void
+{
+    Response::validateMethod('POST');
+
+    // Verificar que se subió un archivo
+    if (!isset($_FILES['file']) || $_FILES['file']['error'] === UPLOAD_ERR_NO_FILE) {
+        Response::error('No se proporcionó ningún archivo', 400, 'NO_FILE');
+    }
+
+    // Obtener nombre opcional
+    $nombre = $_POST['nombre'] ?? null;
+
+    // TODO: Obtener usuario autenticado de la sesión
+    $uploadedBy = 2; // Por ahora, usar usuario de prueba
+
+    try {
+        $pdo = getDatabaseConnection();
+        $templateService = new TemplateService($pdo);
+
+        $result = $templateService->uploadBaseTemplate($_FILES['file'], $uploadedBy, $nombre);
+
+        Response::success($result, 'Plantilla base actualizada correctamente');
+
+    } catch (Exception $e) {
+        Response::error(
+            $e->getMessage(),
+            400,
+            'UPLOAD_ERROR'
+        );
+    }
+}
+
+/**
+ * POST /admin/templates/course/{courseid} - Sube o actualiza plantilla de curso
+ */
+function handleUploadCourseTemplate(int $courseid): void
+{
+    Response::validateMethod('POST');
+
+    // Verificar que se subió un archivo
+    if (!isset($_FILES['file']) || $_FILES['file']['error'] === UPLOAD_ERR_NO_FILE) {
+        Response::error('No se proporcionó ningún archivo', 400, 'NO_FILE');
+    }
+
+    // Obtener nombre opcional
+    $nombre = $_POST['nombre'] ?? null;
+
+    // TODO: Obtener usuario autenticado de la sesión
+    $uploadedBy = 2; // Por ahora, usar usuario de prueba
+
+    try {
+        $pdo = getDatabaseConnection();
+        $templateService = new TemplateService($pdo);
+
+        $result = $templateService->uploadCourseTemplate($courseid, $_FILES['file'], $uploadedBy, $nombre);
+
+        Response::success($result, 'Plantilla del curso actualizada correctamente');
+
+    } catch (Exception $e) {
+        Response::error(
+            $e->getMessage(),
+            400,
+            'UPLOAD_ERROR'
+        );
+    }
+}
+
+/**
+ * DELETE /admin/templates/course/{courseid} - Elimina plantilla de curso
+ */
+function handleDeleteCourseTemplate(int $courseid): void
+{
+    Response::validateMethod('DELETE');
+
+    // TODO: Obtener usuario autenticado de la sesión
+    $deletedBy = 2; // Por ahora, usar usuario de prueba
+
+    try {
+        $pdo = getDatabaseConnection();
+        $templateService = new TemplateService($pdo);
+
+        $templateService->deleteCourseTemplate($courseid, $deletedBy);
+
+        Response::success(null, 'Plantilla del curso eliminada correctamente');
+
+    } catch (Exception $e) {
+        Response::error(
+            $e->getMessage(),
+            404,
+            'DELETE_ERROR'
+        );
+    }
+}
+
+/**
+ * GET /admin/templates/{id}/download - Descarga archivo PPTX de una plantilla
+ */
+function handleDownloadTemplate(int $templateId): void
+{
+    Response::validateMethod('GET');
+
+    try {
+        $pdo = getDatabaseConnection();
+        $templateService = new TemplateService($pdo);
+
+        $template = $templateService->getTemplateForDownload($templateId);
+
+        if (!$template) {
+            Response::error('Plantilla no encontrada', 404, 'NOT_FOUND');
+        }
+
+        // Enviar archivo
+        header('Content-Type: application/vnd.openxmlformats-officedocument.presentationml.presentation');
+        header('Content-Disposition: attachment; filename="' . $template['archivo'] . '"');
+        header('Content-Length: ' . filesize($template['file_path']));
+        header('Cache-Control: private, max-age=0, must-revalidate');
+        header('Pragma: public');
+
+        readfile($template['file_path']);
+        exit;
+
+    } catch (Exception $e) {
+        Response::error(
+            'Error descargando plantilla',
+            500,
+            'DOWNLOAD_ERROR',
+            DEBUG_MODE ? ['error' => $e->getMessage()] : []
+        );
+    }
+}
+
+/**
+ * POST /admin/templates/preview - Genera PDF de preview con datos de ejemplo
+ */
+function handleTemplatePreview(): void
+{
+    Response::validateMethod('POST');
+
+    $input = json_decode(file_get_contents('php://input'), true);
+
+    if (!isset($input['courseid'])) {
+        Response::error('Se requiere courseid', 400, 'INVALID_INPUT');
+    }
+
+    $courseid = (int)$input['courseid'];
+
+    try {
+        $pdo = getDatabaseConnection();
+        $templateService = new TemplateService($pdo);
+
+        $pdfPath = $templateService->generatePreview($courseid);
+
+        // Enviar PDF
+        header('Content-Type: application/pdf');
+        header('Content-Disposition: inline; filename="preview-certificado.pdf"');
+        header('Content-Length: ' . filesize($pdfPath));
+        header('Cache-Control: private, max-age=0, must-revalidate');
+
+        readfile($pdfPath);
+
+        // Limpiar archivo temporal
+        if (strpos($pdfPath, '/temp/') !== false) {
+            unlink($pdfPath);
+        }
+
+        exit;
+
+    } catch (Exception $e) {
+        Response::error(
+            $e->getMessage(),
+            400,
+            'PREVIEW_ERROR'
+        );
+    }
+}
+
+/**
+ * PUT /admin/templates/{id}/fields - Guarda coordenadas de campos de una plantilla
+ */
+function handleSaveTemplateFields(int $templateId): void
+{
+    Response::validateMethod('PUT');
+
+    $input = json_decode(file_get_contents('php://input'), true);
+
+    if (!isset($input['campos']) || !is_array($input['campos'])) {
+        Response::error('Se requiere un objeto "campos" con las coordenadas', 400, 'INVALID_INPUT');
+    }
+
+    // TODO: Obtener usuario autenticado de la sesión
+    $updatedBy = 2; // Por ahora, usar usuario de prueba
+
+    try {
+        $pdo = getDatabaseConnection();
+        $templateService = new TemplateService($pdo);
+
+        $savedFields = $templateService->saveTemplateFields($templateId, $input['campos'], $updatedBy);
+
+        Response::success([
+            'template_id' => $templateId,
+            'campos' => $savedFields
+        ], 'Coordenadas de campos guardadas correctamente');
+
+    } catch (Exception $e) {
+        Response::error(
+            $e->getMessage(),
+            400,
+            'SAVE_FIELDS_ERROR'
+        );
+    }
+}
+
+/**
+ * GET /admin/templates/available-fields - Obtiene los campos disponibles por tipo de plantilla
+ */
+function handleGetAvailableFields(): void
+{
+    Response::validateMethod('GET');
+
+    Response::success([
+        'base' => TemplateService::BASE_TEMPLATE_FIELDS,
+        'curso' => TemplateService::COURSE_TEMPLATE_FIELDS
+    ]);
+}
+
+/**
+ * GET /admin/templates/{id}/preview-image - Obtiene imagen PNG de preview de una plantilla
+ */
+function handleGetTemplatePreviewImage(int $templateId): void
+{
+    Response::validateMethod('GET');
+
+    try {
+        $pdo = getDatabaseConnection();
+
+        // Obtener datos de la plantilla
+        $stmt = $pdo->prepare("
+            SELECT tipo, imagen_preview
+            FROM cc_plantillas
+            WHERE id = ? AND activo = 1
+        ");
+        $stmt->execute([$templateId]);
+        $template = $stmt->fetch(PDO::FETCH_ASSOC);
+
+        if (!$template) {
+            Response::error('Plantilla no encontrada', 404, 'NOT_FOUND');
+        }
+
+        if (!$template['imagen_preview']) {
+            Response::error('La plantilla no tiene imagen de preview', 404, 'NO_PREVIEW');
+        }
+
+        // Construir ruta del archivo
+        $basePath = defined('TEMPLATES_PATH') ? TEMPLATES_PATH : BASE_PATH . '/storage/templates';
+        $subDir = $template['tipo'] === 'base' ? 'base' : 'cursos';
+        $imagePath = $basePath . '/' . $subDir . '/' . $template['imagen_preview'];
+
+        if (!file_exists($imagePath)) {
+            Response::error('Archivo de imagen no encontrado', 404, 'FILE_NOT_FOUND');
+        }
+
+        // Enviar imagen PNG
+        header('Content-Type: image/png');
+        header('Content-Length: ' . filesize($imagePath));
+        header('Cache-Control: public, max-age=3600');
+        header('Content-Disposition: inline; filename="' . $template['imagen_preview'] . '"');
+
+        readfile($imagePath);
+        exit;
+
+    } catch (Exception $e) {
+        Response::error(
+            'Error obteniendo imagen de preview',
+            500,
+            'PREVIEW_IMAGE_ERROR',
+            DEBUG_MODE ? ['error' => $e->getMessage()] : []
+        );
+    }
 }

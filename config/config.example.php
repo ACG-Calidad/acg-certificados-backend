@@ -57,6 +57,7 @@ define('JWT_ALGORITHM', 'HS256');
 // ============================================================
 define('BASE_PATH', dirname(__DIR__));
 define('PDF_STORAGE_PATH', BASE_PATH . '/storage/pdfs');
+define('TEMPLATES_PATH', BASE_PATH . '/storage/templates');
 define('LOG_PATH', BASE_PATH . '/storage/logs');
 define('TEMP_PATH', BASE_PATH . '/storage/temp');
 
