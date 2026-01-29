@@ -602,7 +602,7 @@ function handleApproveCertificates(): void
         $userid = (int)$userItem['userid'];
         $courseId = (int)$userItem['course_id'];
 
-        // Verificar que el usuario completó el curso
+        // Obtener datos del usuario y su calificación en el curso
         $stmt = $pdo->prepare("
             SELECT
                 u.firstname,
@@ -611,20 +611,18 @@ function handleApproveCertificates(): void
                 u.idnumber,
                 c.fullname as course_name,
                 c.shortname as course_shortname,
-                cc.timecompleted as completion_date,
                 gg.finalgrade as grade
-            FROM mdl_course_completions cc
-            INNER JOIN mdl_user u ON cc.userid = u.id
-            INNER JOIN mdl_course c ON cc.course = c.id
+            FROM mdl_user u
+            INNER JOIN mdl_course c ON c.id = ?
             LEFT JOIN mdl_grade_items gi ON gi.courseid = c.id AND gi.itemtype = 'course'
             LEFT JOIN mdl_grade_grades gg ON gg.itemid = gi.id AND gg.userid = u.id
-            WHERE cc.userid = ? AND cc.course = ? AND cc.timecompleted IS NOT NULL
+            WHERE u.id = ?
         ");
-        $stmt->execute([$userid, $courseId]);
+        $stmt->execute([$courseId, $userid]);
         $userData = $stmt->fetch(PDO::FETCH_ASSOC);
 
         if (!$userData) {
-            continue;
+            continue; // Usuario o curso no existe
         }
 
         // Verificar que no existe ya un certificado
@@ -1436,13 +1434,11 @@ function handleSendNotifications(): void
             continue;
         }
 
-        // ================================================================
-        // MOCK: Simular envío de email
-        // TODO: Integrar con Google Apps Script para envío real
-        // ================================================================
-        $emailSent = mockSendEmail($cert);
+        // Enviar via Google Apps Script
+        $asunto = "Tu certificado del curso {$cert['course_name']} - ACG";
+        $result = sendCertificateViaGAS($cert);
 
-        if ($emailSent) {
+        if ($result['success']) {
             // Actualizar estado del certificado a 'notificado'
             $stmt = $pdo->prepare("
                 UPDATE cc_certificados
@@ -1454,15 +1450,35 @@ function handleSendNotifications(): void
             $stmt->execute([$certId]);
 
             // Registrar en log de notificaciones
-            logNotification($pdo, $certId, $cert['email'], 'sent');
+            logNotification(
+                $pdo,
+                $certId,
+                $cert['email'],
+                $asunto,
+                'enviado',
+                null,
+                $result['gas_response'],
+                true,
+                $result['pdf_size'] ?? null
+            );
 
             $sent++;
         } else {
             // Registrar fallo en log
-            logNotification($pdo, $certId, $cert['email'], 'failed', 'Error al enviar email (mock)');
+            logNotification(
+                $pdo,
+                $certId,
+                $cert['email'],
+                $asunto,
+                'fallido',
+                $result['error'],
+                $result['gas_response'],
+                false,
+                null
+            );
 
             $failed++;
-            $errors[] = "Error enviando a {$cert['email']}";
+            $errors[] = "Error enviando a {$cert['email']}: {$result['error']}";
         }
     }
 
@@ -1474,68 +1490,255 @@ function handleSendNotifications(): void
 }
 
 /**
- * MOCK: Simula el envío de un email
+ * Obtiene la configuración de GAS desde la base de datos (tabla cc_configuracion)
  *
- * En producción, esto llamará a Google Apps Script para enviar el email real.
- * Por ahora, simula éxito en el 100% de los casos.
- *
- * @param array $certificate Datos del certificado
- * @return bool true si el email se "envió" correctamente
+ * @return array ['enabled' => bool, 'url' => string, 'api_key' => string]
  */
-function mockSendEmail(array $certificate): bool
+function getGASConfig(): array
 {
-    // Simular un pequeño delay como si estuviéramos enviando
-    usleep(100000); // 100ms
+    static $config = null;
 
-    // Log del mock para debugging
-    error_log(sprintf(
-        "[MOCK EMAIL] Enviando a: %s <%s> - Certificado: %s - Curso: %s",
-        $certificate['firstname'] . ' ' . $certificate['lastname'],
-        $certificate['email'],
-        $certificate['numero_certificado'],
-        $certificate['course_name']
-    ));
+    if ($config !== null) {
+        return $config;
+    }
 
-    // TODO: Cuando se integre con Google Apps Script, esto será:
-    // return $gasService->sendCertificateNotification($certificate);
+    try {
+        $pdo = getDatabaseConnection();
+        $stmt = $pdo->query("
+            SELECT clave, valor
+            FROM cc_configuracion
+            WHERE clave IN ('notificaciones_habilitadas', 'google_apps_script_url', 'google_apps_script_api_key')
+        ");
+        $rows = $stmt->fetchAll(PDO::FETCH_KEY_PAIR);
 
-    // Por ahora, siempre retorna éxito
-    return true;
+        $config = [
+            'enabled' => ($rows['notificaciones_habilitadas'] ?? 'false') === 'true',
+            'url' => $rows['google_apps_script_url'] ?? '',
+            'api_key' => $rows['google_apps_script_api_key'] ?? ''
+        ];
+    } catch (\Exception $e) {
+        error_log("[GAS] Error obteniendo configuración: " . $e->getMessage());
+        $config = [
+            'enabled' => false,
+            'url' => '',
+            'api_key' => ''
+        ];
+    }
+
+    return $config;
 }
 
 /**
- * Registra una notificación en el log
+ * Envía un certificado vía Google Apps Script
+ *
+ * @param array $certificate Datos del certificado con: id, numero_certificado, userid,
+ *                           firstname, lastname, email, course_name
+ * @return array ['success' => bool, 'error' => string|null, 'gas_response' => string|null]
  */
-function logNotification(PDO $pdo, int $certificateId, string $email, string $status, string $errorMessage = null): void
+function sendCertificateViaGAS(array $certificate): array
 {
+    // Obtener configuración de la base de datos
+    $gasConfig = getGASConfig();
+
+    // Verificar si está habilitado
+    if (!$gasConfig['enabled']) {
+        return [
+            'success' => false,
+            'error' => 'La integración con Google Apps Script no está habilitada. Actívala en Configuración.',
+            'gas_response' => null
+        ];
+    }
+
+    // Verificar que hay URL y API key configurados
+    if (empty($gasConfig['url']) || empty($gasConfig['api_key'])) {
+        return [
+            'success' => false,
+            'error' => 'Google Apps Script no está configurado. Configura la URL del Webhook y el API Key en Configuración.',
+            'gas_response' => null
+        ];
+    }
+
+    // Obtener el PDF del certificado usando patrón con timestamp
+    $numeroSanitizado = preg_replace('/[^A-Za-z0-9]/', '_', $certificate['numero_certificado']);
+    $pattern = PDF_STORAGE_PATH . "/certificado_{$numeroSanitizado}_*.pdf";
+    $files = glob($pattern);
+
+    if (empty($files)) {
+        return [
+            'success' => false,
+            'error' => "No se encontró el archivo PDF para el certificado: {$certificate['numero_certificado']}",
+            'gas_response' => null
+        ];
+    }
+
+    // Usar el archivo más reciente si hay varios
+    $pdfPath = end($files);
+
+    $pdfContent = file_get_contents($pdfPath);
+    $pdfBase64 = base64_encode($pdfContent);
+    $pdfSize = filesize($pdfPath);
+
+    // Preparar datos para el GAS
+    $nombre = trim($certificate['firstname'] . ' ' . $certificate['lastname']);
+    $payload = [
+        'api_key' => $gasConfig['api_key'],
+        'action' => 'send_certificate',
+        'email' => $certificate['email'],
+        'nombre' => $nombre,
+        'curso' => $certificate['course_name'],
+        'numero_certificado' => $certificate['numero_certificado'],
+        'pdf_base64' => $pdfBase64,
+        'fecha_emision' => isset($certificate['fecha_emision'])
+            ? date('j \d\e F \d\e Y', $certificate['fecha_emision'])
+            : date('j \d\e F \d\e Y'),
+        'intensidad' => $certificate['intensidad'] ?? '',
+        'calificacion' => $certificate['calificacion'] ?? ''
+    ];
+
+    // Enviar al GAS
+    // IMPORTANTE: No usar reintentos en caso de timeout porque las solicitudes
+    // HTTP a GAS no son cancelables. Si hacemos timeout pero GAS sigue ejecutando,
+    // un reintento causaría emails duplicados.
+    $lastError = null;
+    $response = null;
+    $isTimeoutError = false;
+
     try {
-        // Verificar si existe la tabla de log
-        $stmt = $pdo->query("SHOW TABLES LIKE 'cc_notifications_log'");
-        if (!$stmt->fetch()) {
-            // Crear tabla si no existe
-            $pdo->exec("
-                CREATE TABLE cc_notifications_log (
-                    id INT AUTO_INCREMENT PRIMARY KEY,
-                    certificate_id INT NOT NULL,
-                    recipient_email VARCHAR(255) NOT NULL,
-                    status ENUM('sent', 'failed', 'pending') NOT NULL DEFAULT 'pending',
-                    error_message TEXT,
-                    sent_at INT,
-                    created_at INT NOT NULL,
-                    INDEX idx_certificate (certificate_id),
-                    INDEX idx_status (status)
-                ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
-            ");
+        $ch = curl_init($gasConfig['url']);
+        curl_setopt_array($ch, [
+            CURLOPT_POST => true,
+            CURLOPT_POSTFIELDS => json_encode($payload),
+            CURLOPT_HTTPHEADER => [
+                'Content-Type: application/json',
+                'Accept: application/json'
+            ],
+            CURLOPT_RETURNTRANSFER => true,
+            CURLOPT_TIMEOUT => 90, // 90 segundos para PDFs grandes
+            CURLOPT_CONNECTTIMEOUT => 10, // 10 segundos para conectar
+            CURLOPT_FOLLOWLOCATION => true,
+            CURLOPT_SSL_VERIFYPEER => true
+        ]);
+
+        $response = curl_exec($ch);
+        $httpCode = curl_getinfo($ch, CURLINFO_HTTP_CODE);
+        $curlError = curl_error($ch);
+        $curlErrno = curl_errno($ch);
+        curl_close($ch);
+
+        // Detectar si fue timeout
+        $isTimeoutError = ($curlErrno === CURLE_OPERATION_TIMEDOUT);
+
+        if ($curlError) {
+            $lastError = "Error de conexión: $curlError";
+            error_log("[GAS] $lastError");
+
+            // Si fue timeout, advertir que el email PUEDE haberse enviado
+            if ($isTimeoutError) {
+                return [
+                    'success' => false,
+                    'error' => "Timeout esperando respuesta de GAS. El email PUEDE haberse enviado. No se reintentará para evitar duplicados.",
+                    'gas_response' => null,
+                    'pdf_size' => $pdfSize,
+                    'may_have_sent' => true
+                ];
+            }
+
+            return [
+                'success' => false,
+                'error' => $lastError,
+                'gas_response' => null,
+                'pdf_size' => $pdfSize
+            ];
         }
 
+        // Parsear respuesta del GAS
+        $gasResponse = json_decode($response, true);
+
+        if ($gasResponse && isset($gasResponse['success']) && $gasResponse['success'] === true) {
+            error_log(sprintf(
+                "[GAS] Certificado enviado exitosamente a: %s <%s> - %s",
+                $nombre,
+                $certificate['email'],
+                $certificate['numero_certificado']
+            ));
+
+            return [
+                'success' => true,
+                'error' => null,
+                'gas_response' => $response,
+                'pdf_size' => $pdfSize
+            ];
+        }
+
+        // GAS respondió con error
+        $gasError = $gasResponse['error']['message'] ?? 'Error desconocido del GAS';
+        $lastError = "GAS respondió con error: $gasError";
+        error_log("[GAS] $lastError");
+
+    } catch (\Exception $e) {
+        $lastError = "Excepción: " . $e->getMessage();
+        error_log("[GAS] $lastError");
+    }
+
+    return [
+        'success' => false,
+        'error' => $lastError ?? 'Error desconocido enviando al GAS',
+        'gas_response' => $response ?? null,
+        'pdf_size' => $pdfSize ?? null
+    ];
+}
+
+/**
+ * Registra una notificación en el log (tabla cc_notificaciones_log)
+ *
+ * @param PDO $pdo Conexión a BD
+ * @param int $certificateId ID del certificado
+ * @param string $email Email del destinatario
+ * @param string $asunto Asunto del correo
+ * @param string $estado 'enviado' o 'fallido'
+ * @param string|null $errorMessage Mensaje de error si falló
+ * @param string|null $gasResponse Respuesta del GAS
+ * @param bool $pdfAdjunto Si se adjuntó el PDF
+ * @param int|null $pdfSize Tamaño del PDF en bytes
+ */
+function logNotification(
+    PDO $pdo,
+    int $certificateId,
+    string $email,
+    string $asunto,
+    string $estado,
+    ?string $errorMessage = null,
+    ?string $gasResponse = null,
+    bool $pdfAdjunto = true,
+    ?int $pdfSize = null
+): void {
+    try {
+        $enviado_por = getAuthenticatedUserId();
+
         $stmt = $pdo->prepare("
-            INSERT INTO cc_notifications_log
-            (certificate_id, recipient_email, status, error_message, sent_at, created_at)
-            VALUES (?, ?, ?, ?, ?, UNIX_TIMESTAMP())
+            INSERT INTO cc_notificaciones_log
+            (certificado_id, email_destinatario, asunto, estado, intentos, fecha_envio,
+             fecha_ultimo_intento, mensaje_error, gas_response, pdf_adjunto, pdf_size,
+             enviado_por, created_at)
+            VALUES (:cert_id, :email, :asunto, :estado, 1, :fecha_envio,
+                    UNIX_TIMESTAMP(), :error, :gas_response, :pdf_adjunto, :pdf_size,
+                    :enviado_por, UNIX_TIMESTAMP())
         ");
 
-        $sentAt = ($status === 'sent') ? time() : null;
-        $stmt->execute([$certificateId, $email, $status, $errorMessage, $sentAt]);
+        $fechaEnvio = ($estado === 'enviado') ? time() : null;
+
+        $stmt->execute([
+            'cert_id' => $certificateId,
+            'email' => $email,
+            'asunto' => $asunto,
+            'estado' => $estado,
+            'fecha_envio' => $fechaEnvio,
+            'error' => $errorMessage,
+            'gas_response' => $gasResponse,
+            'pdf_adjunto' => $pdfAdjunto ? 1 : 0,
+            'pdf_size' => $pdfSize,
+            'enviado_por' => $enviado_por
+        ]);
 
     } catch (\Exception $e) {
         error_log("Error logging notification: " . $e->getMessage());
@@ -1829,6 +2032,27 @@ function generateExcelCsv(array $data): void
 }
 
 /**
+ * Mapeo entre claves del frontend y claves de cc_configuracion
+ */
+function getSettingsKeyMap(): array
+{
+    return [
+        // Frontend key => [db_key, tipo, descripcion]
+        'default_intensity' => ['intensidad_horaria_defecto', 'int', 'Intensidad horaria por defecto'],
+        'default_template_id' => ['plantilla_defecto_id', 'int', 'ID de plantilla por defecto'],
+        'certificate_prefix' => ['prefijo_certificado', 'string', 'Prefijo para números de certificado'],
+        'notification_email' => ['email_gestor', 'string', 'Email del gestor de certificados'],
+        'email_from_name' => ['nombre_remitente', 'string', 'Nombre del remitente de emails'],
+        'cron_execution_time' => ['hora_cron_ejecucion', 'string', 'Hora de ejecución del cron diario'],
+        'gas_webhook_url' => ['google_apps_script_url', 'string', 'URL del Google Apps Script para envío de emails'],
+        'gas_api_key' => ['google_apps_script_api_key', 'string', 'API Key para autenticación con Google Apps Script'],
+        'gas_enabled' => ['notificaciones_habilitadas', 'boolean', 'Habilitar/deshabilitar envío automático de notificaciones'],
+        'validation_url' => ['url_validacion_publica', 'string', 'URL pública para validar certificados'],
+        'calificacion_minima' => ['calificacion_minima_aprobacion', 'int', 'Calificación mínima para considerar aprobado']
+    ];
+}
+
+/**
  * GET /api/admin/settings - Obtener configuración del sistema
  */
 function handleGetSettings(): void
@@ -1837,27 +2061,38 @@ function handleGetSettings(): void
 
     $pdo = getDatabaseConnection();
 
-    // Verificar si existe la tabla de configuración
-    ensureSettingsTableExists($pdo);
+    // Asegurar que existan las configuraciones necesarias
+    ensureConfiguracionExists($pdo);
 
-    // Obtener configuraciones
-    $stmt = $pdo->query("SELECT setting_key, setting_value FROM cc_settings");
-    $rows = $stmt->fetchAll(PDO::FETCH_KEY_PAIR);
+    // Obtener configuraciones de cc_configuracion
+    $stmt = $pdo->query("SELECT clave, valor, tipo FROM cc_configuracion");
+    $rows = [];
+    while ($row = $stmt->fetch(PDO::FETCH_ASSOC)) {
+        $rows[$row['clave']] = ['valor' => $row['valor'], 'tipo' => $row['tipo']];
+    }
 
-    // Valores por defecto
+    // Mapear a claves del frontend
+    $keyMap = getSettingsKeyMap();
     $defaults = getDefaultSettings();
-
-    // Combinar con valores guardados
     $settings = [];
-    foreach ($defaults as $key => $default) {
-        $settings[$key] = $rows[$key] ?? $default;
 
-        // Convertir tipos según corresponda
-        if (in_array($key, ['default_intensity', 'default_template_id'])) {
-            $settings[$key] = (int)$settings[$key];
-        }
-        if ($key === 'gas_enabled') {
-            $settings[$key] = (bool)$settings[$key];
+    foreach ($keyMap as $frontendKey => $dbInfo) {
+        $dbKey = $dbInfo[0];
+        $tipo = $dbInfo[1];
+
+        // Obtener valor de BD o usar default
+        $valor = isset($rows[$dbKey]) ? $rows[$dbKey]['valor'] : ($defaults[$frontendKey] ?? null);
+
+        // Convertir según tipo
+        switch ($tipo) {
+            case 'int':
+                $settings[$frontendKey] = (int)$valor;
+                break;
+            case 'boolean':
+                $settings[$frontendKey] = ($valor === 'true' || $valor === '1' || $valor === true);
+                break;
+            default:
+                $settings[$frontendKey] = $valor ?? '';
         }
     }
 
@@ -1878,61 +2113,82 @@ function handleUpdateSettings(): void
     }
 
     $pdo = getDatabaseConnection();
-
-    // Verificar si existe la tabla
-    ensureSettingsTableExists($pdo);
-
-    // Claves permitidas
-    $allowedKeys = array_keys(getDefaultSettings());
+    $keyMap = getSettingsKeyMap();
+    $authenticatedUserId = getAuthenticatedUserId();
 
     // Actualizar cada configuración
     $updated = 0;
-    foreach ($input as $key => $value) {
-        if (!in_array($key, $allowedKeys)) {
-            continue; // Ignorar claves no permitidas
+    foreach ($input as $frontendKey => $value) {
+        if (!isset($keyMap[$frontendKey])) {
+            continue; // Ignorar claves no mapeadas
         }
+
+        $dbKey = $keyMap[$frontendKey][0];
+        $tipo = $keyMap[$frontendKey][1];
+        $descripcion = $keyMap[$frontendKey][2];
 
         // Validar valores específicos
-        if ($key === 'default_intensity' && (!is_numeric($value) || $value < 1)) {
+        if ($frontendKey === 'default_intensity' && (!is_numeric($value) || $value < 1)) {
             continue;
         }
-        if ($key === 'cron_execution_time' && !preg_match('/^\d{2}:\d{2}$/', $value)) {
+        if ($frontendKey === 'cron_execution_time' && !preg_match('/^\d{2}:\d{2}$/', (string)$value)) {
             continue;
         }
-        if ($key === 'notification_email' && !filter_var($value, FILTER_VALIDATE_EMAIL)) {
+        if ($frontendKey === 'notification_email' && !empty($value) && !filter_var($value, FILTER_VALIDATE_EMAIL)) {
             continue;
         }
 
-        // Convertir booleanos a string
-        if (is_bool($value)) {
-            $value = $value ? '1' : '0';
+        // Convertir valor según tipo
+        if ($tipo === 'boolean') {
+            $valorDb = ($value === true || $value === '1' || $value === 'true') ? 'true' : 'false';
+        } elseif ($tipo === 'int') {
+            $valorDb = (string)(int)$value;
+        } else {
+            $valorDb = (string)$value;
         }
 
-        // Insertar o actualizar
+        // Insertar o actualizar en cc_configuracion
         $stmt = $pdo->prepare("
-            INSERT INTO cc_settings (setting_key, setting_value, updated_at)
-            VALUES (:key, :value, UNIX_TIMESTAMP())
+            INSERT INTO cc_configuracion (clave, valor, tipo, descripcion, updated_by, updated_at)
+            VALUES (:clave, :valor, :tipo, :descripcion, :updated_by, UNIX_TIMESTAMP())
             ON DUPLICATE KEY UPDATE
-            setting_value = VALUES(setting_value),
+            valor = VALUES(valor),
+            updated_by = VALUES(updated_by),
             updated_at = UNIX_TIMESTAMP()
         ");
-        $stmt->execute(['key' => $key, 'value' => (string)$value]);
+        $stmt->execute([
+            'clave' => $dbKey,
+            'valor' => $valorDb,
+            'tipo' => $tipo,
+            'descripcion' => $descripcion,
+            'updated_by' => $authenticatedUserId
+        ]);
         $updated++;
     }
 
     // Obtener configuración actualizada
-    $stmt = $pdo->query("SELECT setting_key, setting_value FROM cc_settings");
-    $rows = $stmt->fetchAll(PDO::FETCH_KEY_PAIR);
+    $stmt = $pdo->query("SELECT clave, valor, tipo FROM cc_configuracion");
+    $rows = [];
+    while ($row = $stmt->fetch(PDO::FETCH_ASSOC)) {
+        $rows[$row['clave']] = ['valor' => $row['valor'], 'tipo' => $row['tipo']];
+    }
 
     $defaults = getDefaultSettings();
     $settings = [];
-    foreach ($defaults as $key => $default) {
-        $settings[$key] = $rows[$key] ?? $default;
-        if (in_array($key, ['default_intensity', 'default_template_id'])) {
-            $settings[$key] = (int)$settings[$key];
-        }
-        if ($key === 'gas_enabled') {
-            $settings[$key] = (bool)$settings[$key];
+    foreach ($keyMap as $frontendKey => $dbInfo) {
+        $dbKey = $dbInfo[0];
+        $tipo = $dbInfo[1];
+        $valor = isset($rows[$dbKey]) ? $rows[$dbKey]['valor'] : ($defaults[$frontendKey] ?? null);
+
+        switch ($tipo) {
+            case 'int':
+                $settings[$frontendKey] = (int)$valor;
+                break;
+            case 'boolean':
+                $settings[$frontendKey] = ($valor === 'true' || $valor === '1' || $valor === true);
+                break;
+            default:
+                $settings[$frontendKey] = $valor ?? '';
         }
     }
 
@@ -1954,28 +2210,44 @@ function getDefaultSettings(): array
         'notification_email' => EMAIL_GESTOR ?? 'cursosvirtualesacg@gmail.com',
         'email_from_name' => EMAIL_FROM_NAME ?? 'Grupo Capacitación ACG',
         'cron_execution_time' => CRON_HORA_EJECUCION ?? '07:00',
-        'gas_webhook_url' => GAS_WEBHOOK_URL ?? '',
-        'gas_enabled' => '0',
-        'validation_url' => 'https://certificados.acgcalidad.co/validar'
+        'gas_webhook_url' => '',
+        'gas_api_key' => '',
+        'gas_enabled' => false,
+        'validation_url' => 'https://certificados.acgcalidad.co/validar',
+        'calificacion_minima' => '80'
     ];
 }
 
 /**
- * Asegura que la tabla de configuración exista
+ * Asegura que existan las configuraciones necesarias en cc_configuracion
  */
-function ensureSettingsTableExists(PDO $pdo): void
+function ensureConfiguracionExists(PDO $pdo): void
 {
-    $stmt = $pdo->query("SHOW TABLES LIKE 'cc_settings'");
-    if (!$stmt->fetch()) {
-        $pdo->exec("
-            CREATE TABLE cc_settings (
-                id INT AUTO_INCREMENT PRIMARY KEY,
-                setting_key VARCHAR(100) NOT NULL UNIQUE,
-                setting_value TEXT,
-                updated_at INT,
-                INDEX idx_key (setting_key)
-            ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
-        ");
+    $keyMap = getSettingsKeyMap();
+    $defaults = getDefaultSettings();
+
+    foreach ($keyMap as $frontendKey => $dbInfo) {
+        $dbKey = $dbInfo[0];
+        $tipo = $dbInfo[1];
+        $descripcion = $dbInfo[2];
+
+        // Verificar si existe
+        $stmt = $pdo->prepare("SELECT id FROM cc_configuracion WHERE clave = ?");
+        $stmt->execute([$dbKey]);
+
+        if (!$stmt->fetch()) {
+            // Insertar con valor por defecto
+            $defaultValue = $defaults[$frontendKey] ?? '';
+            if ($tipo === 'boolean') {
+                $defaultValue = $defaultValue ? 'true' : 'false';
+            }
+
+            $stmt = $pdo->prepare("
+                INSERT INTO cc_configuracion (clave, valor, tipo, descripcion, updated_at)
+                VALUES (?, ?, ?, ?, UNIX_TIMESTAMP())
+            ");
+            $stmt->execute([$dbKey, (string)$defaultValue, $tipo, $descripcion]);
+        }
     }
 }
 

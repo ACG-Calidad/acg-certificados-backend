@@ -192,11 +192,13 @@ class MoodleService
         curl_setopt($ch, CURLOPT_FOLLOWLOCATION, false); // NO seguir redirects
 
         // Agregar Host header para que Moodle acepte la petición
-        // Moodle verifica que la petición venga de su wwwroot (localhost:8082)
+        // Moodle verifica que la petición venga de su wwwroot
+        $moodleHost = defined('MOODLE_HOST') ? MOODLE_HOST : 'localhost:8082';
+        $moodleProto = defined('MOODLE_PROTO') ? MOODLE_PROTO : 'http';
         curl_setopt($ch, CURLOPT_HTTPHEADER, [
-            'Host: localhost:8082',
-            'X-Forwarded-Host: localhost:8082',
-            'X-Forwarded-Proto: http'
+            "Host: {$moodleHost}",
+            "X-Forwarded-Host: {$moodleHost}",
+            "X-Forwarded-Proto: {$moodleProto}"
         ]);
 
         // En desarrollo, aceptar certificados SSL autofirmados

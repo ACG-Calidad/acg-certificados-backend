@@ -71,8 +71,12 @@ define('PDF_MAX_GENERATION_BATCH', 100); // Máximo PDFs por lote
 // GOOGLE APPS SCRIPT
 // ============================================================
 define('GAS_WEBHOOK_URL', 'https://script.google.com/macros/s/YOUR_SCRIPT_ID/exec');
-define('GAS_TIMEOUT', 30); // Timeout en segundos
-define('GAS_MAX_RETRIES', 3); // Reintentos en caso de error
+// NOTA: El timeout para envío de certificados es de 90 segundos (hardcoded)
+// para acomodar PDFs grandes. No se usan reintentos automáticos porque
+// las solicitudes HTTP a GAS no son cancelables - un reintento causaría
+// emails duplicados.
+define('GAS_TIMEOUT', 30); // Timeout general (no usado para certificados)
+define('GAS_MAX_RETRIES', 3); // DEPRECADO: Ya no se usa para evitar duplicados
 
 // ============================================================
 // NOTIFICACIONES

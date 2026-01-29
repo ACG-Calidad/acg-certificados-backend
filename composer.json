@@ -29,7 +29,8 @@
         "psr-4": {
             "ACG\\Certificados\\": "lib/",
             "ACG\\Certificados\\Models\\": "lib/models/",
-            "ACG\\Certificados\\Services\\": "lib/services/"
+            "ACG\\Certificados\\Services\\": "lib/services/",
+            "ACG\\Certificados\\Utils\\": "lib/utils/"
         }
     },
     "autoload-dev": {
