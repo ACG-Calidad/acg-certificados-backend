@@ -108,6 +108,12 @@ try {
             handleGetCertificateGenerations((int)$matches[1]),
 
         // ========================================================================
+        // Admin - Eliminar certificado generado
+        // ========================================================================
+        $requestMethod === 'DELETE' && preg_match('#^/admin/certificates/(\d+)$#', $requestUri, $matches) =>
+            handleDeleteCertificate((int)$matches[1]),
+
+        // ========================================================================
         // Admin - Exportar reporte de certificados (Excel/CSV)
         // ========================================================================
         $requestMethod === 'GET' && $requestUri === '/admin/report/export' => handleExportReport(),
@@ -1090,6 +1096,70 @@ function handleGetCertificateGenerations(int $certificateId): void
         'generations' => $generations,
         'total' => count($generations)
     ]);
+}
+
+/**
+ * DELETE /admin/certificates/{id} - Eliminar un certificado generado
+ *
+ * Elimina el registro de la BD y el PDF físico si existe.
+ * Las FKs manejan automáticamente:
+ *   - cc_notificaciones_log  → ON DELETE CASCADE
+ *   - cc_descargas_log       → ON DELETE CASCADE
+ *   - cc_generaciones_log    → ON DELETE SET NULL
+ *   - cc_validaciones_log    → ON DELETE SET NULL
+ */
+function handleDeleteCertificate(int $id): void
+{
+    Response::validateMethod('DELETE');
+
+    $pdo = getDatabaseConnection();
+
+    // 1. Verificar que el certificado existe y obtener sus datos
+    $stmt = $pdo->prepare("
+        SELECT
+            c.id,
+            c.numero_certificado,
+            c.userid,
+            c.courseid,
+            c.estado,
+            u.firstname,
+            u.lastname,
+            co.fullname as course_name
+        FROM cc_certificados c
+        INNER JOIN mdl_user u ON c.userid = u.id
+        INNER JOIN mdl_course co ON c.courseid = co.id
+        WHERE c.id = :id
+    ");
+    $stmt->execute(['id' => $id]);
+    $certificate = $stmt->fetch(PDO::FETCH_ASSOC);
+
+    if (!$certificate) {
+        Response::error('Certificado no encontrado', 404, 'NOT_FOUND');
+    }
+
+    // 2. Eliminar PDF físico si existe en el storage
+    $pdfDeleted = false;
+    $templateService = new TemplateService($pdo);
+    $pdfPath = $templateService->getCertificatePath($certificate['numero_certificado']);
+    if ($pdfPath && file_exists($pdfPath)) {
+        @unlink($pdfPath);
+        $pdfDeleted = true;
+    }
+
+    // 3. Eliminar el registro (las FKs gestionan los registros hijos automáticamente)
+    $stmt = $pdo->prepare("DELETE FROM cc_certificados WHERE id = :id");
+    $stmt->execute(['id' => $id]);
+
+    Response::success([
+        'deleted' => [
+            'id' => $certificate['id'],
+            'numero_certificado' => $certificate['numero_certificado'],
+            'participant' => $certificate['firstname'] . ' ' . $certificate['lastname'],
+            'course' => $certificate['course_name'],
+            'estado' => $certificate['estado'],
+            'pdf_deleted' => $pdfDeleted
+        ]
+    ], 'Certificado eliminado correctamente');
 }
 
 /**
