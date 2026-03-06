@@ -72,6 +72,16 @@ try {
         $requestMethod === 'POST' && $requestUri === '/admin/certificates/approve' => handleApproveCertificates(),
 
         // ========================================================================
+        // Admin - Ocultar usuarios pendientes
+        // ========================================================================
+        $requestMethod === 'POST' && $requestUri === '/admin/certificates/hide' => handleHidePendingUsers(),
+
+        // ========================================================================
+        // Admin - Mostrar usuarios pendientes ocultos
+        // ========================================================================
+        $requestMethod === 'POST' && $requestUri === '/admin/certificates/unhide' => handleUnhidePendingUsers(),
+
+        // ========================================================================
         // Admin - Conteos para badges del sidebar
         // ========================================================================
         $requestMethod === 'GET' && $requestUri === '/admin/badges' => handleAdminBadges(),
@@ -541,36 +551,75 @@ function handlePendingCertificates(): void
 
     $pdo = getDatabaseConnection();
 
+    $includeHidden = isset($_GET['include_hidden']) && $_GET['include_hidden'] === 'true';
+
     // Usuarios con calificación en cursos que no tienen certificado
     // Se usa timemodified de mdl_grade_grades como fecha de última calificación
-    $stmt = $pdo->query("
-        SELECT
-            u.id as userid,
-            u.firstname,
-            u.lastname,
-            u.email,
-            u.idnumber,
-            c.id as course_id,
-            c.fullname as course_name,
-            c.shortname as course_shortname,
-            gg.finalgrade as grade,
-            gg.timemodified as grade_date
-        FROM mdl_grade_grades gg
-        INNER JOIN mdl_grade_items gi ON gg.itemid = gi.id AND gi.itemtype = 'course'
-        INNER JOIN mdl_user u ON gg.userid = u.id
-        INNER JOIN mdl_course c ON gi.courseid = c.id
-        LEFT JOIN cc_certificados cert ON gg.userid = cert.userid AND gi.courseid = cert.courseid
-        WHERE gg.finalgrade IS NOT NULL
-        AND cert.id IS NULL
-        ORDER BY gg.timemodified DESC
-    ");
+    if ($includeHidden) {
+        $stmt = $pdo->query("
+            SELECT
+                u.id as userid,
+                u.firstname,
+                u.lastname,
+                u.email,
+                u.idnumber,
+                c.id as course_id,
+                c.fullname as course_name,
+                c.shortname as course_shortname,
+                gg.finalgrade as grade_raw,
+                gi.grademax,
+                gg.timemodified as grade_date,
+                CASE WHEN oculto.userid IS NOT NULL THEN 1 ELSE 0 END as is_hidden
+            FROM mdl_grade_grades gg
+            INNER JOIN mdl_grade_items gi ON gg.itemid = gi.id AND gi.itemtype = 'course'
+            INNER JOIN mdl_user u ON gg.userid = u.id
+            INNER JOIN mdl_course c ON gi.courseid = c.id
+            LEFT JOIN cc_certificados cert ON gg.userid = cert.userid AND gi.courseid = cert.courseid
+            LEFT JOIN cc_pendientes_ocultos oculto ON gg.userid = oculto.userid AND gi.courseid = oculto.courseid
+            WHERE gg.finalgrade IS NOT NULL
+            AND cert.id IS NULL
+            ORDER BY is_hidden ASC, gg.timemodified DESC
+        ");
+    } else {
+        $stmt = $pdo->query("
+            SELECT
+                u.id as userid,
+                u.firstname,
+                u.lastname,
+                u.email,
+                u.idnumber,
+                c.id as course_id,
+                c.fullname as course_name,
+                c.shortname as course_shortname,
+                gg.finalgrade as grade_raw,
+                gi.grademax,
+                gg.timemodified as grade_date,
+                0 as is_hidden
+            FROM mdl_grade_grades gg
+            INNER JOIN mdl_grade_items gi ON gg.itemid = gi.id AND gi.itemtype = 'course'
+            INNER JOIN mdl_user u ON gg.userid = u.id
+            INNER JOIN mdl_course c ON gi.courseid = c.id
+            LEFT JOIN cc_certificados cert ON gg.userid = cert.userid AND gi.courseid = cert.courseid
+            LEFT JOIN cc_pendientes_ocultos oculto ON gg.userid = oculto.userid AND gi.courseid = oculto.courseid
+            WHERE gg.finalgrade IS NOT NULL
+            AND cert.id IS NULL
+            AND oculto.userid IS NULL
+            ORDER BY gg.timemodified DESC
+        ");
+    }
 
     $pendingUsers = $stmt->fetchAll(PDO::FETCH_ASSOC);
 
-    // Formatear datos
+    // Formatear datos — convertir calificación raw a porcentaje
     foreach ($pendingUsers as &$user) {
-        $user['grade'] = $user['grade'] ? round($user['grade'], 2) : null;
+        $gradeRaw = $user['grade_raw'];
+        $gradeMax = (float)($user['grademax'] ?? 0);
+        $user['grade'] = ($gradeRaw !== null && $gradeMax > 0)
+            ? round(($gradeRaw / $gradeMax) * 100, 2)
+            : null;
+        unset($user['grade_raw'], $user['grademax']);
         $user['grade_date_formatted'] = $user['grade_date'] ? date('Y-m-d H:i:s', $user['grade_date']) : null;
+        $user['is_hidden'] = (bool)$user['is_hidden'];
     }
 
     Response::success([
@@ -617,7 +666,8 @@ function handleApproveCertificates(): void
                 u.idnumber,
                 c.fullname as course_name,
                 c.shortname as course_shortname,
-                gg.finalgrade as grade
+                gg.finalgrade as grade,
+                gi.grademax
             FROM mdl_user u
             INNER JOIN mdl_course c ON c.id = ?
             LEFT JOIN mdl_grade_items gi ON gi.courseid = c.id AND gi.itemtype = 'course'
@@ -656,7 +706,11 @@ function handleApproveCertificates(): void
             (userid, courseid, numero_certificado, hash_validacion, fecha_emision, intensidad, calificacion, estado, created_by, created_at, updated_at)
             VALUES (?, ?, ?, ?, ?, ?, ?, 'generado', ?, UNIX_TIMESTAMP(), UNIX_TIMESTAMP())
         ");
-        $grade = $userData['grade'] ? round($userData['grade'], 2) : null;
+        $gradeRaw = $userData['grade'] ?? null;
+        $gradeMax = (float)($userData['grademax'] ?? 0);
+        $grade = ($gradeRaw !== null && $gradeMax > 0)
+            ? round(($gradeRaw / $gradeMax) * 100, 2)
+            : ($gradeRaw !== null ? round($gradeRaw, 2) : null);
         $createdBy = getAuthenticatedUserId() ?? $userid;
         $stmt->execute([$userid, $courseId, $numeroCertificado, $hashValidacion, $fechaEmision, $intensidad, $grade, $createdBy]);
 
@@ -731,6 +785,83 @@ function handleApproveCertificates(): void
     }
 
     Response::success($response);
+}
+
+/**
+ * POST /admin/certificates/hide - Ocultar usuarios pendientes de la lista
+ *
+ * Body: { items: [{userid, course_id}] }
+ */
+function handleHidePendingUsers(): void
+{
+    Response::validateMethod('POST');
+
+    $input = json_decode(file_get_contents('php://input'), true);
+
+    if (!isset($input['items']) || !is_array($input['items']) || empty($input['items'])) {
+        Response::error('Se requiere un array de items con userid y course_id', 400, 'INVALID_INPUT');
+    }
+
+    $pdo = getDatabaseConnection();
+
+    $stmt = $pdo->prepare("
+        INSERT IGNORE INTO cc_pendientes_ocultos (userid, courseid, oculto_por, created_at)
+        VALUES (:userid, :courseid, :oculto_por, :created_at)
+    ");
+
+    $hidden = 0;
+    $now = time();
+
+    foreach ($input['items'] as $item) {
+        if (!isset($item['userid']) || !isset($item['course_id'])) {
+            continue;
+        }
+        $stmt->execute([
+            'userid'     => (int)$item['userid'],
+            'courseid'   => (int)$item['course_id'],
+            'oculto_por' => 0,
+            'created_at' => $now
+        ]);
+        $hidden += $stmt->rowCount();
+    }
+
+    Response::success(['hidden' => $hidden], "Se ocultaron {$hidden} usuario(s)");
+}
+
+/**
+ * POST /admin/certificates/unhide - Volver a mostrar usuarios pendientes ocultos
+ *
+ * Body: { items: [{userid, course_id}] }
+ */
+function handleUnhidePendingUsers(): void
+{
+    Response::validateMethod('POST');
+
+    $input = json_decode(file_get_contents('php://input'), true);
+
+    if (!isset($input['items']) || !is_array($input['items']) || empty($input['items'])) {
+        Response::error('Se requiere un array de items con userid y course_id', 400, 'INVALID_INPUT');
+    }
+
+    $pdo = getDatabaseConnection();
+
+    $shown = 0;
+
+    foreach ($input['items'] as $item) {
+        if (!isset($item['userid']) || !isset($item['course_id'])) {
+            continue;
+        }
+        $stmt = $pdo->prepare("
+            DELETE FROM cc_pendientes_ocultos WHERE userid = :userid AND courseid = :courseid
+        ");
+        $stmt->execute([
+            'userid'   => (int)$item['userid'],
+            'courseid' => (int)$item['course_id']
+        ]);
+        $shown += $stmt->rowCount();
+    }
+
+    Response::success(['shown' => $shown], "Se mostraron {$shown} usuario(s)");
 }
 
 /**
@@ -1431,12 +1562,18 @@ function handlePendingNotifications(): void
             c.courseid as course_id,
             co.fullname as course_name,
             co.shortname as course_shortname,
-            c.calificacion as grade,
+            CASE
+                WHEN gi.grademax > 0 AND gi.grademax != 100
+                    THEN ROUND((gg.finalgrade / gi.grademax) * 100, 2)
+                ELSE c.calificacion
+            END as grade,
             FROM_UNIXTIME(c.fecha_emision, '%Y-%m-%d') as fecha_emision,
             FROM_UNIXTIME(c.created_at, '%Y-%m-%d %H:%i:%s') as created_at
         FROM cc_certificados c
         INNER JOIN mdl_user u ON c.userid = u.id
         INNER JOIN mdl_course co ON c.courseid = co.id
+        LEFT JOIN mdl_grade_items gi ON gi.courseid = c.courseid AND gi.itemtype = 'course'
+        LEFT JOIN mdl_grade_grades gg ON gg.itemid = gi.id AND gg.userid = c.userid
         WHERE c.estado = 'generado'
         ORDER BY c.created_at DESC
     ");
@@ -1828,15 +1965,18 @@ function handleAdminBadges(): void
 
     $pdo = getDatabaseConnection();
 
-    // Usuarios con calificación >= 80% que no tienen certificado
+    // Usuarios con calificación >= 80% que no tienen certificado y no están ocultos
     $stmt = $pdo->query("
         SELECT COUNT(*) as count
         FROM mdl_grade_grades gg
         INNER JOIN mdl_grade_items gi ON gg.itemid = gi.id AND gi.itemtype = 'course'
         LEFT JOIN cc_certificados cert ON gg.userid = cert.userid AND gi.courseid = cert.courseid
+        LEFT JOIN cc_pendientes_ocultos oculto ON gg.userid = oculto.userid AND gi.courseid = oculto.courseid
         WHERE gg.finalgrade IS NOT NULL
-        AND gg.finalgrade >= 80
+        AND gi.grademax > 0
+        AND (gg.finalgrade / gi.grademax) * 100 >= 80
         AND cert.id IS NULL
+        AND oculto.userid IS NULL
     ");
     $pendingApproved = (int)$stmt->fetch(PDO::FETCH_ASSOC)['count'];
 
