@@ -567,7 +567,7 @@ function handlePendingCertificates(): void
                 c.fullname as course_name,
                 c.shortname as course_shortname,
                 gg.finalgrade as grade_raw,
-                gi.grademax,
+                gg.rawgrademax as grademax,
                 gg.timemodified as grade_date,
                 CASE WHEN oculto.userid IS NOT NULL THEN 1 ELSE 0 END as is_hidden
             FROM mdl_grade_grades gg
@@ -592,7 +592,7 @@ function handlePendingCertificates(): void
                 c.fullname as course_name,
                 c.shortname as course_shortname,
                 gg.finalgrade as grade_raw,
-                gi.grademax,
+                gg.rawgrademax as grademax,
                 gg.timemodified as grade_date,
                 0 as is_hidden
             FROM mdl_grade_grades gg
@@ -667,7 +667,7 @@ function handleApproveCertificates(): void
                 c.fullname as course_name,
                 c.shortname as course_shortname,
                 gg.finalgrade as grade,
-                gi.grademax
+                gg.rawgrademax as grademax
             FROM mdl_user u
             INNER JOIN mdl_course c ON c.id = ?
             LEFT JOIN mdl_grade_items gi ON gi.courseid = c.id AND gi.itemtype = 'course'
@@ -1563,8 +1563,8 @@ function handlePendingNotifications(): void
             co.fullname as course_name,
             co.shortname as course_shortname,
             CASE
-                WHEN gi.grademax > 0 AND gi.grademax != 100
-                    THEN ROUND((gg.finalgrade / gi.grademax) * 100, 2)
+                WHEN gg.rawgrademax > 0 AND gg.rawgrademax != 100
+                    THEN ROUND((gg.finalgrade / gg.rawgrademax) * 100, 2)
                 ELSE c.calificacion
             END as grade,
             FROM_UNIXTIME(c.fecha_emision, '%Y-%m-%d') as fecha_emision,
@@ -1973,8 +1973,8 @@ function handleAdminBadges(): void
         LEFT JOIN cc_certificados cert ON gg.userid = cert.userid AND gi.courseid = cert.courseid
         LEFT JOIN cc_pendientes_ocultos oculto ON gg.userid = oculto.userid AND gi.courseid = oculto.courseid
         WHERE gg.finalgrade IS NOT NULL
-        AND gi.grademax > 0
-        AND (gg.finalgrade / gi.grademax) * 100 >= 80
+        AND gg.rawgrademax > 0
+        AND (gg.finalgrade / gg.rawgrademax) * 100 >= 80
         AND cert.id IS NULL
         AND oculto.userid IS NULL
     ");
