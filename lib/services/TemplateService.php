@@ -137,6 +137,10 @@ class TemplateService
             if (!$this->columnExists('cc_plantillas', 'imagen_preview')) {
                 $this->pdo->exec("ALTER TABLE cc_plantillas ADD COLUMN imagen_preview VARCHAR(255) NULL AFTER archivo_size");
             }
+            // Migración: agregar columna intensidad_horaria si no existe
+            if (!$this->columnExists('cc_plantillas', 'intensidad_horaria')) {
+                $this->pdo->exec("ALTER TABLE cc_plantillas ADD COLUMN intensidad_horaria INT UNSIGNED NULL DEFAULT NULL AFTER imagen_preview");
+            }
         }
 
         // Verificar tabla cc_plantillas_campos
@@ -739,6 +743,29 @@ class TemplateService
         $this->logTemplateAction('delete_course', $template['id'], $deletedBy, ['courseid' => $courseid]);
 
         return true;
+    }
+
+    /**
+     * Actualiza la intensidad horaria de la plantilla de un curso
+     */
+    public function updateCourseIntensidad(int $courseid, int $intensidad): void
+    {
+        $stmt = $this->pdo->prepare("
+            SELECT id FROM cc_plantillas
+            WHERE tipo = 'curso' AND courseid = ? AND activo = 1
+        ");
+        $stmt->execute([$courseid]);
+        $template = $stmt->fetch(PDO::FETCH_ASSOC);
+
+        if (!$template) {
+            throw new Exception("No existe plantilla para el curso: {$courseid}");
+        }
+
+        $stmt = $this->pdo->prepare("
+            UPDATE cc_plantillas SET intensidad_horaria = ?, updated_at = UNIX_TIMESTAMP()
+            WHERE id = ?
+        ");
+        $stmt->execute([$intensidad, $template['id']]);
     }
 
     /**

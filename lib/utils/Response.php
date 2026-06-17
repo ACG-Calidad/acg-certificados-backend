@@ -101,7 +101,7 @@ class Response
             header("Access-Control-Allow-Origin: {$origin}");
         }
 
-        header('Access-Control-Allow-Methods: GET, POST, PUT, DELETE, OPTIONS');
+        header('Access-Control-Allow-Methods: GET, POST, PUT, PATCH, DELETE, OPTIONS');
         header('Access-Control-Allow-Headers: Content-Type, Authorization, X-User-Id, X-User-Name, X-User-Role');
         header('Access-Control-Allow-Credentials: true');
     }

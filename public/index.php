@@ -161,6 +161,12 @@ try {
             handleDeleteCourseTemplate((int)$matches[1]),
 
         // ========================================================================
+        // Admin - Plantillas: Actualizar intensidad horaria de un curso
+        // ========================================================================
+        $requestMethod === 'PATCH' && preg_match('#^/admin/templates/course/(\d+)/intensity$#', $requestUri, $matches) =>
+            handleUpdateCourseIntensity((int)$matches[1]),
+
+        // ========================================================================
         // Admin - Plantillas: Descargar plantilla
         // ========================================================================
         $requestMethod === 'GET' && preg_match('#^/admin/templates/(\d+)/download$#', $requestUri, $matches) =>
@@ -696,8 +702,24 @@ function handleApproveCertificates(): void
         // Generar hash de validación
         $hashValidacion = hash('sha256', $numeroCertificado . $userid . $courseId . time());
 
-        // Intensidad por defecto (40 horas) - TODO: obtener de configuración del curso en Moodle
-        $intensidad = 40;
+        // Intensidad horaria: específica del curso (cc_plantillas) o default global (cc_configuracion)
+        static $intensidadCache = [];
+        if (!isset($intensidadCache[$courseId])) {
+            $intStmt = $pdo->prepare("
+                SELECT COALESCE(
+                    (SELECT intensidad_horaria FROM cc_plantillas
+                     WHERE tipo = 'curso' AND courseid = ? AND activo = 1 LIMIT 1),
+                    (SELECT CAST(valor AS UNSIGNED) FROM cc_configuracion
+                     WHERE clave = 'intensidad_horaria_defecto')
+                ) as intensidad
+            ");
+            $intStmt->execute([$courseId]);
+            $intRow = $intStmt->fetch(PDO::FETCH_ASSOC);
+            $intensidadCache[$courseId] = ($intRow && $intRow['intensidad'] !== null)
+                ? (int)$intRow['intensidad']
+                : 40;
+        }
+        $intensidad = $intensidadCache[$courseId];
 
         // Crear registro del certificado con estado 'generado' (listo para notificar)
         $fechaEmision = time();
@@ -2721,6 +2743,37 @@ function handleGetAvailableFields(): void
         'base' => TemplateService::BASE_TEMPLATE_FIELDS,
         'curso' => TemplateService::COURSE_TEMPLATE_FIELDS
     ]);
+}
+
+/**
+ * PATCH /admin/templates/course/{courseid}/intensity - Actualiza la intensidad horaria de un curso
+ *
+ * Body: { intensidad: 120 }
+ */
+function handleUpdateCourseIntensity(int $courseid): void
+{
+    Response::validateMethod('PATCH');
+
+    $input = json_decode(file_get_contents('php://input'), true);
+
+    if (!isset($input['intensidad']) || !is_numeric($input['intensidad']) || (int)$input['intensidad'] < 1) {
+        Response::error('Se requiere un valor de intensidad válido (entero >= 1)', 400, 'INVALID_INPUT');
+    }
+
+    $intensidad = (int)$input['intensidad'];
+
+    try {
+        $pdo = getDatabaseConnection();
+        $templateService = new TemplateService($pdo);
+        $templateService->updateCourseIntensidad($courseid, $intensidad);
+
+        Response::success(
+            ['courseid' => $courseid, 'intensidad_horaria' => $intensidad],
+            "Intensidad horaria actualizada a {$intensidad} horas"
+        );
+    } catch (Exception $e) {
+        Response::error($e->getMessage(), 404, 'UPDATE_ERROR');
+    }
 }
 
 /**
