@@ -39,3 +39,6 @@ Thumbs.db
 # Backups
 *.sql
 *.sql.gz
+
+# Estado local de oh-my-claudecode
+.omc/
