@@ -1,5 +1,6 @@
 # Configuración con credenciales
 config/config.php
+config/config.production.php
 
 # Composer
 /vendor/
